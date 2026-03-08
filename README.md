@@ -300,3 +300,40 @@ Optional controls:
 # Disable auto push for current shell/session
 export AUTO_SYNC_TO_GITHUB=false
 ```
+
+## 8) One-Click Release (`v0.x.y`)
+
+Release strategy:
+- Use semantic version tags in `v0.x.y` format.
+- Default bump is `patch` (for example, `v0.1.0 -> v0.1.1`).
+- The script enforces: clean working tree, security scan, sync `main`, tag push, then GitHub release creation.
+
+Create a patch release (default):
+
+```bash
+cd "$PROJECT_DIR"
+./scripts/release.sh
+```
+
+Create a minor/major release:
+
+```bash
+./scripts/release.sh --minor
+./scripts/release.sh --major
+```
+
+Set explicit version:
+
+```bash
+./scripts/release.sh --version v0.2.0
+```
+
+Optional release controls:
+
+```bash
+./scripts/release.sh --notes "Release highlights"
+./scripts/release.sh --notes-file ./release-notes.md
+./scripts/release.sh --draft
+./scripts/release.sh --prerelease
+./scripts/release.sh --no-generate-notes
+```
