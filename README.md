@@ -211,9 +211,57 @@ cd "$PROJECT_DIR"
 ./scripts/github_token_keychain.sh status
 ```
 
-Read/delete token:
+Available commands:
 
 ```bash
+# Store / update token
+./scripts/github_token_keychain.sh set <github_pat_xxx>
+
+# Check whether token exists (does not print token)
+./scripts/github_token_keychain.sh status
+
+# Read token (for scripting only; avoid printing in shared terminals)
 ./scripts/github_token_keychain.sh get
+
+# Delete token from keychain
 ./scripts/github_token_keychain.sh delete
+```
+
+Optional environment variables:
+
+```bash
+export GITHUB_TOKEN_KEYCHAIN_SERVICE="feishu-bot-bridge.github.token"
+export GITHUB_TOKEN_KEYCHAIN_ACCOUNT="mzyag"
+```
+
+## 6) Cloud Server Credential Storage (Keychain)
+
+Store cloud server login credentials in macOS Keychain:
+
+```bash
+cd "$PROJECT_DIR"
+./scripts/cloud_server_keychain.sh set --host <ip-or-host> --user <username> --password '<password>'
+```
+
+Available commands:
+
+```bash
+# Example: save credentials
+./scripts/cloud_server_keychain.sh set --host 103.133.176.103 --user root --password '<password>'
+
+# Check whether credentials exist (host/user shown, password masked)
+./scripts/cloud_server_keychain.sh status
+
+# Read full JSON payload (contains password; use carefully)
+./scripts/cloud_server_keychain.sh get
+
+# Delete credentials
+./scripts/cloud_server_keychain.sh delete
+```
+
+Optional environment variables:
+
+```bash
+export CLOUD_SERVER_KEYCHAIN_SERVICE="feishu-bot-bridge.cloud.server"
+export CLOUD_SERVER_KEYCHAIN_ACCOUNT="default"
 ```
