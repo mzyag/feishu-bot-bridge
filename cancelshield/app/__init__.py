@@ -1,1 +1,0 @@
-"""CancelShield application package."""

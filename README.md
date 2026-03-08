@@ -15,8 +15,15 @@ Feishu long-connection bot using `lark-oapi`:
 
 ## 1) Install
 
+Use path-safe variables (avoid hardcoded `/Users/...`):
+
 ```bash
-cd /Users/cn/Workspace/feishu-bot-bridge
+export WORKSPACE_ROOT="${WORKSPACE_ROOT:-$HOME/Workspace}"
+export PROJECT_DIR="${PROJECT_DIR:-$WORKSPACE_ROOT/feishu-bot-bridge}"
+```
+
+```bash
+cd "$PROJECT_DIR"
 python3 -m pip install -r requirements.txt
 ```
 
@@ -30,7 +37,7 @@ Edit `.env`:
 - `OPENAI_API_KEY` (optional; if empty, service uses echo reply)
 - `ALLOWED_USER_IDS` (comma-separated Feishu `open_id`, e.g. `ou_xxx,ou_yyy`)
 - `USE_CODEX_CLI=true` (default; prefer local codex CLI)
-- `CODEX_WORKDIR=/Users/cn/Workspace` (codex execution root)
+- `CODEX_WORKDIR=${WORKSPACE_ROOT}` (codex execution root)
 - `CODEX_SANDBOX=workspace-write` (allow writing inside `CODEX_WORKDIR`)
 - `CODEX_ADD_DIRS=` (optional comma-separated extra writable dirs)
 - `CODEX_RESUME_ENABLED=true` (recommended; reuse per-user Codex thread for context continuity)
@@ -49,35 +56,35 @@ Tip:
 ## 3) Run
 
 ```bash
-cd /Users/cn/Workspace/feishu-bot-bridge
+cd "$PROJECT_DIR"
 python3 ws_bot.py
 ```
 
 Run as launchd service (recommended):
 
 ```bash
-cd /Users/cn/Workspace/feishu-bot-bridge
+cd "$PROJECT_DIR"
 ./scripts/launchd_manage.sh start
 ```
 
 Stop service:
 
 ```bash
-cd /Users/cn/Workspace/feishu-bot-bridge
+cd "$PROJECT_DIR"
 ./scripts/launchd_manage.sh stop
 ```
 
 Check service status:
 
 ```bash
-cd /Users/cn/Workspace/feishu-bot-bridge
+cd "$PROJECT_DIR"
 ./scripts/launchd_manage.sh status
 ```
 
 View fixed logs:
 
 ```bash
-cd /Users/cn/Workspace/feishu-bot-bridge
+cd "$PROJECT_DIR"
 ./scripts/launchd_manage.sh logs
 ```
 
@@ -94,7 +101,7 @@ Configure in `.env`:
 Start scheduled task:
 
 ```bash
-cd /Users/cn/Workspace/feishu-bot-bridge
+cd "$PROJECT_DIR"
 ./scripts/launchd_daily_report.sh start
 ```
 
@@ -134,12 +141,12 @@ Configure in `.env`:
 - `SCOUT_TARGET_MARKET=global_en`
 - `SCOUT_REPORT_LANGUAGE=zh-CN`
 - `SCOUT_FALLBACK_POLICY=send_low_confidence`
-- `SCOUT_OUTPUT_DIR=/Users/cn/Workspace/feishu-bot-bridge/reports/opportunity-scout`
-- `SCOUT_JOB_LOCK_FILE=/Users/cn/Workspace/feishu-bot-bridge/.state/opportunity_scout_job.lock` (防并发重跑)
+- `SCOUT_OUTPUT_DIR=${PROJECT_DIR}/reports/opportunity-scout`
+- `SCOUT_JOB_LOCK_FILE=${PROJECT_DIR}/.state/opportunity_scout_job.lock` (防并发重跑)
 - `SCOUT_WATCHDOG_INTERVAL_SEC=360` (boot 后每 6 分钟巡检一次)
 - `SCOUT_WATCHDOG_GRACE_MIN=20` (超过计划时间后多少分钟开始判定“漏跑”)
-- `SCOUT_WATCHDOG_CODEX_TIMEOUT_SEC=900` (watchdog 补跑的超时保护；仅在 `SCOUT_CODEX_TIMEOUT_SEC<=0` 时生效)
-- `SCOUT_WATCHDOG_STATE_FILE=/Users/cn/Workspace/feishu-bot-bridge/.state/opportunity_scout_watchdog.json`
+- `SCOUT_WATCHDOG_CODEX_TIMEOUT_SEC=1800` (watchdog 补跑的超时保护；仅在 `SCOUT_CODEX_TIMEOUT_SEC<=0` 时生效)
+- `SCOUT_WATCHDOG_STATE_FILE=${PROJECT_DIR}/.state/opportunity_scout_watchdog.json`
 
 Runtime behavior:
 
@@ -150,7 +157,7 @@ Runtime behavior:
 Start scheduled task:
 
 ```bash
-cd /Users/cn/Workspace/feishu-bot-bridge
+cd "$PROJECT_DIR"
 ./scripts/launchd_opportunity_scout.sh start
 ```
 
@@ -192,3 +199,20 @@ Use:
 
 Enable event:
 - `im.message.receive_v1`
+
+## 5) GitHub Token Storage (Keychain)
+
+For local GitHub automation, store PAT in macOS Keychain instead of `.env`:
+
+```bash
+cd "$PROJECT_DIR"
+./scripts/github_token_keychain.sh set <github_pat_xxx>
+./scripts/github_token_keychain.sh status
+```
+
+Read/delete token:
+
+```bash
+./scripts/github_token_keychain.sh get
+./scripts/github_token_keychain.sh delete
+```
