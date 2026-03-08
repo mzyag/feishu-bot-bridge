@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.cn.feishu-bot-bridge</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>-u</string>
+    <string>/Users/cn/Workspace/feishu-bot-bridge/ws_bot.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/cn/Workspace/feishu-bot-bridge</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/cn/Workspace/feishu-bot-bridge/logs/launchd.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/cn/Workspace/feishu-bot-bridge/logs/launchd.err.log</string>
+</dict>
+</plist>

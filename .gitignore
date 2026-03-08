@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.log
+.state/
+logs/
+reports/
+*.pid
+*.sqlite
+*.sqlite-*
+.DS_Store
