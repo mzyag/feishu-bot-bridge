@@ -193,7 +193,7 @@ REPO="${OWNER_REPO#*/}"
 
 if GIT_TERMINAL_PROMPT=0 \
   GIT_ASKPASS="$ROOT_DIR/scripts/github_askpass.sh" \
-  git -c credential.helper= ls-remote --tags origin "refs/tags/$VERSION" | rg -q "$VERSION$"; then
+  git -c credential.helper= -c http.version=HTTP/1.1 ls-remote --tags origin "refs/tags/$VERSION" | rg -q "$VERSION$"; then
   echo "[release] tag already exists on remote: $VERSION" >&2
   exit 2
 fi
@@ -204,7 +204,7 @@ git tag -a "$VERSION" -m "feishu-bot-bridge $VERSION"
 
 GIT_TERMINAL_PROMPT=0 \
 GIT_ASKPASS="$ROOT_DIR/scripts/github_askpass.sh" \
-git -c credential.helper= push origin "$VERSION"
+git -c credential.helper= -c http.version=HTTP/1.1 push origin "$VERSION"
 
 if [ -n "$NOTES_FILE" ]; then
   BODY="$(cat "$NOTES_FILE")"

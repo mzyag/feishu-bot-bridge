@@ -66,7 +66,7 @@ if [ -x ./scripts/github_token_keychain.sh ] && [ -x ./scripts/github_askpass.sh
   if ./scripts/github_token_keychain.sh status >/dev/null 2>&1; then
     GIT_TERMINAL_PROMPT=0 \
     GIT_ASKPASS="$ROOT_DIR/scripts/github_askpass.sh" \
-    git -c credential.helper= push origin "$BRANCH"
+    git -c credential.helper= -c http.version=HTTP/1.1 push origin "$BRANCH"
     exit 0
   fi
 fi
