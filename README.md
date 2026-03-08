@@ -247,7 +247,7 @@ Available commands:
 
 ```bash
 # Example: save credentials
-./scripts/cloud_server_keychain.sh set --host 103.133.176.103 --user root --password '<password>'
+./scripts/cloud_server_keychain.sh set --host <server-ip> --user <ssh-user> --password '<password>'
 
 # Check whether credentials exist (host/user shown, password masked)
 ./scripts/cloud_server_keychain.sh status
