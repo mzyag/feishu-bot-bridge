@@ -265,3 +265,38 @@ Optional environment variables:
 export CLOUD_SERVER_KEYCHAIN_SERVICE="feishu-bot-bridge.cloud.server"
 export CLOUD_SERVER_KEYCHAIN_ACCOUNT="default"
 ```
+
+## 7) Auto Sync + Security Policy (Required)
+
+Policy:
+- Every push must pass security scan.
+- After code commit, auto sync to GitHub.
+- If private information is detected, push is blocked until masked.
+
+Enable hooks once per clone:
+
+```bash
+cd "$PROJECT_DIR"
+git config core.hooksPath .githooks
+chmod +x .githooks/pre-push .githooks/post-commit scripts/security_scan_before_push.sh scripts/safe_sync_to_github.sh
+```
+
+Manual safe sync command:
+
+```bash
+# Scan -> commit (if needed) -> push
+./scripts/safe_sync_to_github.sh "chore: your commit message"
+```
+
+Security scan only:
+
+```bash
+./scripts/security_scan_before_push.sh
+```
+
+Optional controls:
+
+```bash
+# Disable auto push for current shell/session
+export AUTO_SYNC_TO_GITHUB=false
+```

@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT_DIR"
+
+if [ "${SAFE_SYNC_IN_PROGRESS:-}" = "1" ]; then
+  exit 0
+fi
+
+if [ "${AUTO_SYNC_TO_GITHUB:-true}" != "true" ]; then
+  exit 0
+fi
+
+echo "[post-commit] running security scan + auto push..."
+if ! ./scripts/safe_sync_to_github.sh --push-only --quiet; then
+  echo "[post-commit] auto sync failed, run manually: ./scripts/safe_sync_to_github.sh" >&2
+fi
