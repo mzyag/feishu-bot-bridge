@@ -98,6 +98,7 @@ Configure in `.env`:
 - `DAILY_REPORT_SEND_OPEN_ID` (if empty, fallback to first `ALLOWED_USER_IDS`)
 - `DAILY_REPORT_WORKSPACE_ROOT` (memory root)
 - `DAILY_REPORT_SESSIONS_DIR` (session source)
+- `DAILY_REPORT_CURRENT_WORKDIR`（当前工作窗口目录，用于日报附加 Git/改动快照）
 
 Start scheduled task:
 
@@ -130,6 +131,12 @@ Task outputs:
 - report: `reports/daily-YYYY-MM-DD.md`
 - memory diary: `memory/diary/YYYY/daily/YYYY-MM-DD.md`
 - session-memory sync (if available): `memory/YYYY-MM-DD.md`
+
+Daily report includes:
+
+- session summary from local Codex session logs
+- local Codex runtime snapshot (`.state/codex_threads.json` / `.state/codex_memory.json`)
+- current workdir snapshot (git branch / uncommitted changes / commits of the day)
 
 ## 3.2 Daily Opportunity Scout (08:00 Feishu + Local Codex)
 

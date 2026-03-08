@@ -7,9 +7,12 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-import lark_oapi as lark
+try:
+    import lark_oapi as lark
+except ImportError:
+    lark = None
 from dotenv import load_dotenv
 
 
@@ -26,6 +29,7 @@ class Config:
     send_open_id: str
     sessions_dir: Path
     workspace_root: Path
+    current_workdir: Path
     date_mode: str
 
     @staticmethod
@@ -35,6 +39,10 @@ class Config:
         send_open_id = os.getenv("DAILY_REPORT_SEND_OPEN_ID", "").strip() or (allowed[0] if allowed else "")
         sessions_dir_raw = os.getenv("DAILY_REPORT_SESSIONS_DIR", "~/.codex/sessions").strip()
         workspace_raw = os.getenv("DAILY_REPORT_WORKSPACE_ROOT", str(DEFAULT_WORKSPACE)).strip()
+        current_workdir_raw = (
+            os.getenv("DAILY_REPORT_CURRENT_WORKDIR", "").strip()
+            or str(PROJECT_ROOT)
+        )
         return Config(
             app_id=os.getenv("FEISHU_APP_ID", "").strip(),
             app_secret=os.getenv("FEISHU_APP_SECRET", "").strip(),
@@ -42,6 +50,7 @@ class Config:
             send_open_id=send_open_id,
             sessions_dir=Path(os.path.expanduser(sessions_dir_raw)),
             workspace_root=Path(workspace_raw),
+            current_workdir=Path(os.path.expanduser(current_workdir_raw)),
             date_mode=os.getenv("DAILY_REPORT_DATE_MODE", "today").strip().lower(),
         )
 
@@ -255,7 +264,103 @@ def _find_issues(messages: List[Dict[str, str]]) -> List[str]:
     return issues
 
 
-def build_report_markdown(report_date: str, messages: List[Dict[str, str]], session_count: int) -> str:
+def _resolve_state_path(raw_path: str) -> Path:
+    path = Path(os.path.expanduser(raw_path))
+    if path.is_absolute():
+        return path
+    return PROJECT_ROOT / path
+
+
+def collect_codex_runtime_snapshot(cfg: Config, messages: List[Dict[str, str]], session_count: int) -> Dict[str, Any]:
+    thread_path = _resolve_state_path(os.getenv("CODEX_THREAD_STATE_FILE", ".state/codex_threads.json"))
+    memory_path = _resolve_state_path(os.getenv("CODEX_MEMORY_STATE_FILE", ".state/codex_memory.json"))
+    thread_user_count = 0
+    memory_user_count = 0
+
+    if thread_path.exists():
+        try:
+            data = json.loads(thread_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                thread_user_count = len(data)
+        except Exception:
+            pass
+
+    if memory_path.exists():
+        try:
+            data = json.loads(memory_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                memory_user_count = len(data)
+        except Exception:
+            pass
+
+    clean_messages = [m for m in messages if not _is_noise_text(m["text"])]
+    top_user_intents = _pick_unique_texts(clean_messages, role="user", limit=3)
+
+    return {
+        "sessions_dir": str(cfg.sessions_dir),
+        "session_count": session_count,
+        "message_count": len(messages),
+        "thread_state_path": str(thread_path),
+        "thread_user_count": thread_user_count,
+        "memory_state_path": str(memory_path),
+        "memory_user_count": memory_user_count,
+        "top_user_intents": top_user_intents,
+    }
+
+
+def _run_git(workdir: Path, args: List[str], timeout_sec: int = 8) -> Tuple[int, str, str]:
+    result = subprocess.run(
+        ["git", "-C", str(workdir), *args],
+        capture_output=True,
+        text=True,
+        timeout=timeout_sec,
+        check=False,
+    )
+    return result.returncode, (result.stdout or "").strip(), (result.stderr or "").strip()
+
+
+def collect_work_snapshot(report_date: str, workdir: Path) -> Dict[str, Any]:
+    snapshot: Dict[str, Any] = {
+        "workdir": str(workdir),
+        "is_git_repo": False,
+        "branch": "",
+        "status_items": [],
+        "today_commits": [],
+        "errors": [],
+    }
+    if not workdir.exists():
+        snapshot["errors"].append("工作目录不存在。")
+        return snapshot
+
+    code, out, err = _run_git(workdir, ["rev-parse", "--is-inside-work-tree"])
+    if code != 0 or out != "true":
+        snapshot["errors"].append(err[:180] if err else "目录不是 Git 仓库。")
+        return snapshot
+
+    snapshot["is_git_repo"] = True
+    _, branch, _ = _run_git(workdir, ["branch", "--show-current"])
+    snapshot["branch"] = branch or "(detached)"
+
+    _, status_out, _ = _run_git(workdir, ["status", "--porcelain"])
+    snapshot["status_items"] = [line.rstrip() for line in status_out.splitlines() if line.strip()]
+
+    since_text = f"{report_date} 00:00:00"
+    until_text = f"{report_date} 23:59:59"
+    _, log_out, _ = _run_git(
+        workdir,
+        ["log", "--since", since_text, "--until", until_text, "--pretty=format:%h %s", "--max-count", "8"],
+    )
+    snapshot["today_commits"] = [line for line in log_out.splitlines() if line.strip()]
+    return snapshot
+
+
+def build_report_markdown(
+    report_date: str,
+    messages: List[Dict[str, str]],
+    session_count: int,
+    codex_snapshot: Dict[str, Any],
+    work_snapshot: Dict[str, Any],
+) -> str:
     clean_messages = [m for m in messages if not _is_noise_text(m["text"])]
     user_tasks = _pick_unique_texts(clean_messages, role="user", limit=8)
     outcomes = _pick_unique_texts(
@@ -300,6 +405,47 @@ def build_report_markdown(report_date: str, messages: List[Dict[str, str]], sess
             lines.append(f"- {o}")
     else:
         lines.append("- 今日未检索到明确的执行结果描述。")
+    lines.append("")
+    lines.append("## 本机 Codex 快照")
+    lines.append(f"- 会话来源目录：`{codex_snapshot.get('sessions_dir', '')}`")
+    lines.append(
+        f"- 当日会话/消息：{codex_snapshot.get('session_count', 0)} / {codex_snapshot.get('message_count', 0)}"
+    )
+    lines.append(
+        f"- 线程映射用户数：{codex_snapshot.get('thread_user_count', 0)}（`{codex_snapshot.get('thread_state_path', '')}`）"
+    )
+    lines.append(
+        f"- 本地短记忆用户数：{codex_snapshot.get('memory_user_count', 0)}（`{codex_snapshot.get('memory_state_path', '')}`）"
+    )
+    top_intents = codex_snapshot.get("top_user_intents", []) or []
+    if top_intents:
+        lines.append("- 本机 Codex 高频任务：")
+        for item in top_intents:
+            lines.append(f"  - {item}")
+    else:
+        lines.append("- 本机 Codex 高频任务：今日无可提取项。")
+    lines.append("")
+    lines.append("## 当前窗口工作快照")
+    lines.append(f"- 工作目录：`{work_snapshot.get('workdir', '')}`")
+    if work_snapshot.get("is_git_repo"):
+        lines.append(f"- Git 分支：{work_snapshot.get('branch', '(unknown)')}")
+        status_items = work_snapshot.get("status_items", []) or []
+        lines.append(f"- 未提交改动数：{len(status_items)}")
+        if status_items:
+            lines.append("- 改动文件（前 10 条）：")
+            for row in status_items[:10]:
+                lines.append(f"  - `{row}`")
+        today_commits = work_snapshot.get("today_commits", []) or []
+        if today_commits:
+            lines.append("- 今日提交（前 8 条）：")
+            for commit in today_commits[:8]:
+                lines.append(f"  - {commit}")
+        else:
+            lines.append("- 今日提交：暂无。")
+    else:
+        errors = work_snapshot.get("errors", []) or []
+        for err in errors:
+            lines.append(f"- {err}")
     lines.append("")
     lines.append("## 问题与异常")
     if issues:
@@ -415,6 +561,8 @@ def send_to_feishu(cfg: Config, title: str, body_markdown: str, dry_run: bool) -
     if dry_run:
         print("[dry-run] skip Feishu sending.")
         return
+    if lark is None:
+        raise RuntimeError("Missing dependency: lark_oapi. Run `pip install -r requirements.txt`.")
     if not cfg.app_id or not cfg.app_secret:
         raise RuntimeError("Missing FEISHU_APP_ID/FEISHU_APP_SECRET.")
     if not cfg.send_open_id:
@@ -467,7 +615,9 @@ def main() -> None:
     cfg = Config.from_env()
     report_date = resolve_report_date(cfg, args.date)
     messages, session_count = collect_messages_for_date(cfg.sessions_dir, report_date)
-    report_md = build_report_markdown(report_date, messages, session_count)
+    codex_snapshot = collect_codex_runtime_snapshot(cfg, messages, session_count)
+    work_snapshot = collect_work_snapshot(report_date, cfg.current_workdir)
+    report_md = build_report_markdown(report_date, messages, session_count, codex_snapshot, work_snapshot)
 
     report_file, memory_file = write_outputs(report_date, report_md, cfg.workspace_root)
     session_memory_result = sync_session_memory(report_date, cfg.workspace_root)
