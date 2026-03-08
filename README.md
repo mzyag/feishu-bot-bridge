@@ -99,6 +99,9 @@ Configure in `.env`:
 - `DAILY_REPORT_WORKSPACE_ROOT` (memory root)
 - `DAILY_REPORT_SESSIONS_DIR` (session source)
 - `DAILY_REPORT_CURRENT_WORKDIR`（当前工作窗口目录，用于日报附加 Git/改动快照）
+- `DAILY_REPORT_SCOPE`（日报范围，逗号分隔）
+  - 默认：`codex_snapshot,work_snapshot`
+  - 可选：`session_summary,codex_snapshot,work_snapshot`
 
 Start scheduled task:
 
@@ -134,9 +137,10 @@ Task outputs:
 
 Daily report includes:
 
-- session summary from local Codex session logs
-- local Codex runtime snapshot (`.state/codex_threads.json` / `.state/codex_memory.json`)
-- current workdir snapshot (git branch / uncommitted changes / commits of the day)
+- content controlled by `DAILY_REPORT_SCOPE`
+- `session_summary`: session summary from local Codex session logs
+- `codex_snapshot`: local Codex runtime snapshot (`.state/codex_threads.json` / `.state/codex_memory.json`)
+- `work_snapshot`: current workdir snapshot (git branch / uncommitted changes / commits of the day)
 
 ## 3.2 Daily Opportunity Scout (08:00 Feishu + Local Codex)
 

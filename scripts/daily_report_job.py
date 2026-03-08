@@ -19,6 +19,35 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path("/Users/cn/Workspace/feishu-bot-bridge")
 DEFAULT_WORKSPACE = Path("/Users/cn/Workspace")
 SESSION_TO_MEMORY_SCRIPT = Path("/Users/cn/.codex/skills/session-memory-workspace/scripts/session-to-memory.js")
+DEFAULT_DAILY_REPORT_SCOPES = ["codex_snapshot", "work_snapshot"]
+
+
+def _parse_report_scopes(raw: str) -> List[str]:
+    alias_map = {
+        "session": "session_summary",
+        "sessions": "session_summary",
+        "session_summary": "session_summary",
+        "session_messages": "session_summary",
+        "messages": "session_summary",
+        "codex": "codex_snapshot",
+        "codex_snapshot": "codex_snapshot",
+        "local_codex": "codex_snapshot",
+        "work": "work_snapshot",
+        "work_snapshot": "work_snapshot",
+        "git": "work_snapshot",
+        "current_workdir": "work_snapshot",
+    }
+    items = [x.strip().lower() for x in raw.split(",") if x.strip()]
+    if not items:
+        return DEFAULT_DAILY_REPORT_SCOPES.copy()
+    parsed: List[str] = []
+    for item in items:
+        normalized = alias_map.get(item)
+        if normalized and normalized not in parsed:
+            parsed.append(normalized)
+    if not parsed:
+        return DEFAULT_DAILY_REPORT_SCOPES.copy()
+    return parsed
 
 
 @dataclass
@@ -31,6 +60,7 @@ class Config:
     workspace_root: Path
     current_workdir: Path
     date_mode: str
+    report_scopes: List[str]
 
     @staticmethod
     def from_env() -> "Config":
@@ -43,6 +73,7 @@ class Config:
             os.getenv("DAILY_REPORT_CURRENT_WORKDIR", "").strip()
             or str(PROJECT_ROOT)
         )
+        scope_raw = os.getenv("DAILY_REPORT_SCOPE", "").strip()
         return Config(
             app_id=os.getenv("FEISHU_APP_ID", "").strip(),
             app_secret=os.getenv("FEISHU_APP_SECRET", "").strip(),
@@ -52,6 +83,7 @@ class Config:
             workspace_root=Path(workspace_raw),
             current_workdir=Path(os.path.expanduser(current_workdir_raw)),
             date_mode=os.getenv("DAILY_REPORT_DATE_MODE", "today").strip().lower(),
+            report_scopes=_parse_report_scopes(scope_raw),
         )
 
 
@@ -360,7 +392,9 @@ def build_report_markdown(
     session_count: int,
     codex_snapshot: Dict[str, Any],
     work_snapshot: Dict[str, Any],
+    report_scopes: List[str],
 ) -> str:
+    enabled_scopes = set(report_scopes)
     clean_messages = [m for m in messages if not _is_noise_text(m["text"])]
     user_tasks = _pick_unique_texts(clean_messages, role="user", limit=8)
     outcomes = _pick_unique_texts(
@@ -388,80 +422,92 @@ def build_report_markdown(
     lines: List[str] = []
     lines.append(f"# 日报（{report_date}）")
     lines.append("")
-    lines.append("## 今日概览")
-    lines.append(f"- 会话数：{session_count}")
-    lines.append(f"- 消息数：{total_msgs}（用户 {user_count} / 助手 {assistant_count}）")
+    lines.append("## 报告范围")
+    lines.append(f"- 已启用：{', '.join(report_scopes)}")
     lines.append("")
-    lines.append("## 今日工作内容")
-    if user_tasks:
-        for t in user_tasks:
-            lines.append(f"- {t}")
-    else:
-        lines.append("- 今日未检索到有效任务消息。")
-    lines.append("")
-    lines.append("## 执行结果")
-    if outcomes:
-        for o in outcomes:
-            lines.append(f"- {o}")
-    else:
-        lines.append("- 今日未检索到明确的执行结果描述。")
-    lines.append("")
-    lines.append("## 本机 Codex 快照")
-    lines.append(f"- 会话来源目录：`{codex_snapshot.get('sessions_dir', '')}`")
-    lines.append(
-        f"- 当日会话/消息：{codex_snapshot.get('session_count', 0)} / {codex_snapshot.get('message_count', 0)}"
-    )
-    lines.append(
-        f"- 线程映射用户数：{codex_snapshot.get('thread_user_count', 0)}（`{codex_snapshot.get('thread_state_path', '')}`）"
-    )
-    lines.append(
-        f"- 本地短记忆用户数：{codex_snapshot.get('memory_user_count', 0)}（`{codex_snapshot.get('memory_state_path', '')}`）"
-    )
-    top_intents = codex_snapshot.get("top_user_intents", []) or []
-    if top_intents:
-        lines.append("- 本机 Codex 高频任务：")
-        for item in top_intents:
-            lines.append(f"  - {item}")
-    else:
-        lines.append("- 本机 Codex 高频任务：今日无可提取项。")
-    lines.append("")
-    lines.append("## 当前窗口工作快照")
-    lines.append(f"- 工作目录：`{work_snapshot.get('workdir', '')}`")
-    if work_snapshot.get("is_git_repo"):
-        lines.append(f"- Git 分支：{work_snapshot.get('branch', '(unknown)')}")
-        status_items = work_snapshot.get("status_items", []) or []
-        lines.append(f"- 未提交改动数：{len(status_items)}")
-        if status_items:
-            lines.append("- 改动文件（前 10 条）：")
-            for row in status_items[:10]:
-                lines.append(f"  - `{row}`")
-        today_commits = work_snapshot.get("today_commits", []) or []
-        if today_commits:
-            lines.append("- 今日提交（前 8 条）：")
-            for commit in today_commits[:8]:
-                lines.append(f"  - {commit}")
+
+    if "session_summary" in enabled_scopes:
+        lines.append("## 今日概览")
+        lines.append(f"- 会话数：{session_count}")
+        lines.append(f"- 消息数：{total_msgs}（用户 {user_count} / 助手 {assistant_count}）")
+        lines.append("")
+        lines.append("## 今日工作内容")
+        if user_tasks:
+            for t in user_tasks:
+                lines.append(f"- {t}")
         else:
-            lines.append("- 今日提交：暂无。")
-    else:
-        errors = work_snapshot.get("errors", []) or []
-        for err in errors:
-            lines.append(f"- {err}")
-    lines.append("")
-    lines.append("## 问题与异常")
-    if issues:
-        for i in issues:
-            lines.append(f"- {i}")
-    else:
-        lines.append("- 未发现明显错误关键词。")
-    lines.append("")
-    lines.append("## 反思与改进")
-    for r in reflection:
-        lines.append(f"- {r}")
-    lines.append("")
-    lines.append("## 明日行动")
-    lines.append("- 按优先级执行未闭环事项，并在完成后更新日志与记忆。")
-    lines.append("- 对关键链路执行一次端到端回归（接收 -> 处理 -> 回发 -> 日志）。")
-    lines.append("")
+            lines.append("- 今日未检索到有效任务消息。")
+        lines.append("")
+        lines.append("## 执行结果")
+        if outcomes:
+            for o in outcomes:
+                lines.append(f"- {o}")
+        else:
+            lines.append("- 今日未检索到明确的执行结果描述。")
+        lines.append("")
+
+    if "codex_snapshot" in enabled_scopes:
+        lines.append("## 本机 Codex 快照")
+        lines.append(f"- 会话来源目录：`{codex_snapshot.get('sessions_dir', '')}`")
+        lines.append(
+            f"- 当日会话/消息：{codex_snapshot.get('session_count', 0)} / {codex_snapshot.get('message_count', 0)}"
+        )
+        lines.append(
+            f"- 线程映射用户数：{codex_snapshot.get('thread_user_count', 0)}（`{codex_snapshot.get('thread_state_path', '')}`）"
+        )
+        lines.append(
+            f"- 本地短记忆用户数：{codex_snapshot.get('memory_user_count', 0)}（`{codex_snapshot.get('memory_state_path', '')}`）"
+        )
+        top_intents = codex_snapshot.get("top_user_intents", []) or []
+        if top_intents:
+            lines.append("- 本机 Codex 高频任务：")
+            for item in top_intents:
+                lines.append(f"  - {item}")
+        else:
+            lines.append("- 本机 Codex 高频任务：今日无可提取项。")
+        lines.append("")
+
+    if "work_snapshot" in enabled_scopes:
+        lines.append("## 当前窗口工作快照")
+        lines.append(f"- 工作目录：`{work_snapshot.get('workdir', '')}`")
+        if work_snapshot.get("is_git_repo"):
+            lines.append(f"- Git 分支：{work_snapshot.get('branch', '(unknown)')}")
+            status_items = work_snapshot.get("status_items", []) or []
+            lines.append(f"- 未提交改动数：{len(status_items)}")
+            if status_items:
+                lines.append("- 改动文件（前 10 条）：")
+                for row in status_items[:10]:
+                    lines.append(f"  - `{row}`")
+            today_commits = work_snapshot.get("today_commits", []) or []
+            if today_commits:
+                lines.append("- 今日提交（前 8 条）：")
+                for commit in today_commits[:8]:
+                    lines.append(f"  - {commit}")
+            else:
+                lines.append("- 今日提交：暂无。")
+        else:
+            errors = work_snapshot.get("errors", []) or []
+            for err in errors:
+                lines.append(f"- {err}")
+        lines.append("")
+
+    if "session_summary" in enabled_scopes:
+        lines.append("## 问题与异常")
+        if issues:
+            for i in issues:
+                lines.append(f"- {i}")
+        else:
+            lines.append("- 未发现明显错误关键词。")
+        lines.append("")
+        lines.append("## 反思与改进")
+        for r in reflection:
+            lines.append(f"- {r}")
+        lines.append("")
+        lines.append("## 明日行动")
+        lines.append("- 按优先级执行未闭环事项，并在完成后更新日志与记忆。")
+        lines.append("- 对关键链路执行一次端到端回归（接收 -> 处理 -> 回发 -> 日志）。")
+        lines.append("")
+
     return "\n".join(lines)
 
 
@@ -614,13 +660,38 @@ def main() -> None:
 
     cfg = Config.from_env()
     report_date = resolve_report_date(cfg, args.date)
-    messages, session_count = collect_messages_for_date(cfg.sessions_dir, report_date)
-    codex_snapshot = collect_codex_runtime_snapshot(cfg, messages, session_count)
-    work_snapshot = collect_work_snapshot(report_date, cfg.current_workdir)
-    report_md = build_report_markdown(report_date, messages, session_count, codex_snapshot, work_snapshot)
+    enabled_scopes = set(cfg.report_scopes)
+    needs_messages = bool(enabled_scopes & {"session_summary", "codex_snapshot"})
+
+    if needs_messages:
+        messages, session_count = collect_messages_for_date(cfg.sessions_dir, report_date)
+    else:
+        messages, session_count = [], 0
+
+    codex_snapshot = (
+        collect_codex_runtime_snapshot(cfg, messages, session_count)
+        if "codex_snapshot" in enabled_scopes
+        else {}
+    )
+    work_snapshot = (
+        collect_work_snapshot(report_date, cfg.current_workdir)
+        if "work_snapshot" in enabled_scopes
+        else {}
+    )
+    report_md = build_report_markdown(
+        report_date,
+        messages,
+        session_count,
+        codex_snapshot,
+        work_snapshot,
+        cfg.report_scopes,
+    )
 
     report_file, memory_file = write_outputs(report_date, report_md, cfg.workspace_root)
-    session_memory_result = sync_session_memory(report_date, cfg.workspace_root)
+    if "session_summary" in enabled_scopes:
+        session_memory_result = sync_session_memory(report_date, cfg.workspace_root)
+    else:
+        session_memory_result = "session-memory sync skipped by DAILY_REPORT_SCOPE."
 
     send_to_feishu(cfg, f"【自动日报】{report_date}", report_md, dry_run=args.dry_run)
 
