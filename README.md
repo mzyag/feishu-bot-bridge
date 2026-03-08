@@ -38,6 +38,7 @@ Edit `.env`:
 - `ALLOWED_USER_IDS` (comma-separated Feishu `open_id`, e.g. `ou_xxx,ou_yyy`)
 - `USE_CODEX_CLI=true` (default; prefer local codex CLI)
 - `CODEX_WORKDIR=${WORKSPACE_ROOT}` (codex execution root)
+- `CODEX_PROJECT_ROOT=${WORKSPACE_ROOT}` (飞书里“新建项目”默认落地目录)
 - `CODEX_SANDBOX=workspace-write` (allow writing inside `CODEX_WORKDIR`)
 - `CODEX_ADD_DIRS=` (optional comma-separated extra writable dirs)
 - `CODEX_RESUME_ENABLED=true` (recommended; reuse per-user Codex thread for context continuity)
