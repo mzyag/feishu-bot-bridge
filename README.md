@@ -278,7 +278,7 @@ Enable hooks once per clone:
 ```bash
 cd "$PROJECT_DIR"
 git config core.hooksPath .githooks
-chmod +x .githooks/pre-push .githooks/post-commit scripts/security_scan_before_push.sh scripts/safe_sync_to_github.sh
+chmod +x .githooks/pre-push .githooks/post-commit scripts/security_scan_before_push.sh scripts/safe_sync_to_github.sh scripts/github_askpass.sh scripts/release.sh
 ```
 
 Manual safe sync command:
@@ -307,6 +307,7 @@ Release strategy:
 - Use semantic version tags in `v0.x.y` format.
 - Default bump is `patch` (for example, `v0.1.0 -> v0.1.1`).
 - The script enforces: clean working tree, security scan, sync `main`, tag push, then GitHub release creation.
+- Requires GitHub token in Keychain (`./scripts/github_token_keychain.sh set <github_pat_xxx>`).
 
 Create a patch release (default):
 

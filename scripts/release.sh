@@ -112,6 +112,11 @@ if [ ! -x ./scripts/github_token_keychain.sh ]; then
   exit 2
 fi
 
+if [ ! -x ./scripts/github_askpass.sh ]; then
+  echo "[release] missing askpass helper: ./scripts/github_askpass.sh" >&2
+  exit 2
+fi
+
 if ! TOKEN="$(./scripts/github_token_keychain.sh get 2>/dev/null)"; then
   echo "[release] cannot read GitHub token from keychain" >&2
   exit 2
@@ -186,7 +191,9 @@ REPO="${OWNER_REPO#*/}"
 
 ./scripts/safe_sync_to_github.sh --push-only --quiet
 
-if GIT_TERMINAL_PROMPT=0 git -c credential.helper= ls-remote --tags origin "refs/tags/$VERSION" | rg -q "$VERSION$"; then
+if GIT_TERMINAL_PROMPT=0 \
+  GIT_ASKPASS="$ROOT_DIR/scripts/github_askpass.sh" \
+  git -c credential.helper= ls-remote --tags origin "refs/tags/$VERSION" | rg -q "$VERSION$"; then
   echo "[release] tag already exists on remote: $VERSION" >&2
   exit 2
 fi
@@ -195,12 +202,9 @@ fi
 
 git tag -a "$VERSION" -m "feishu-bot-bridge $VERSION"
 
-BASIC="$(printf 'x-access-token:%s' "$TOKEN" | base64)"
-git \
-  -c credential.helper= \
-  -c http.version=HTTP/1.1 \
-  -c http.https://github.com/.extraheader="AUTHORIZATION: basic ${BASIC}" \
-  push origin "$VERSION"
+GIT_TERMINAL_PROMPT=0 \
+GIT_ASKPASS="$ROOT_DIR/scripts/github_askpass.sh" \
+git -c credential.helper= push origin "$VERSION"
 
 if [ -n "$NOTES_FILE" ]; then
   BODY="$(cat "$NOTES_FILE")"
@@ -208,16 +212,21 @@ else
   BODY="$NOTES"
 fi
 
-/usr/bin/python3 - "$TOKEN" "$OWNER" "$REPO" "$VERSION" "$DRAFT" "$PRERELEASE" "$GENERATE_NOTES" "$BODY" <<'PY'
+/usr/bin/env GITHUB_API_TOKEN="$TOKEN" /usr/bin/python3 - "$OWNER" "$REPO" "$VERSION" "$DRAFT" "$PRERELEASE" "$GENERATE_NOTES" "$BODY" <<'PY'
 import json
 import sys
 from urllib import error, request
 
-token, owner, repo, version = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-draft = bool(int(sys.argv[5]))
-prerelease = bool(int(sys.argv[6]))
-generate_notes = bool(int(sys.argv[7]))
-body = sys.argv[8]
+token = __import__("os").environ.get("GITHUB_API_TOKEN", "")
+owner, repo, version = sys.argv[1], sys.argv[2], sys.argv[3]
+draft = bool(int(sys.argv[4]))
+prerelease = bool(int(sys.argv[5]))
+generate_notes = bool(int(sys.argv[6]))
+body = sys.argv[7]
+
+if not token:
+    print("[release] missing token for release API", file=sys.stderr)
+    sys.exit(1)
 
 payload = {
     "tag_name": version,
