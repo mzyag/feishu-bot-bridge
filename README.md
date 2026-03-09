@@ -153,6 +153,8 @@ Configure in `.env`:
 - `SCOUT_TARGET_MARKET=global_en`
 - `SCOUT_REPORT_LANGUAGE=zh-CN`
 - `SCOUT_FALLBACK_POLICY=send_low_confidence`
+- `SCOUT_NOVELTY_LOOKBACK_DAYS=3` (去重参考天数，读取最近报告做“题材去重”)
+- `SCOUT_NOVELTY_MAX_PENALTY=0.7` (新颖性惩罚上限，越大越倾向避开重复题材)
 - `SCOUT_OUTPUT_DIR=${PROJECT_DIR}/reports/opportunity-scout`
 - `SCOUT_JOB_LOCK_FILE=${PROJECT_DIR}/.state/opportunity_scout_job.lock` (防并发重跑)
 - `SCOUT_WATCHDOG_INTERVAL_SEC=360` (boot 后每 6 分钟巡检一次)
@@ -165,6 +167,8 @@ Runtime behavior:
 - runs local `codex exec --search` in read-only mode for both research phases
 - does not require `OPENAI_API_KEY` for the scout task
 - still uses Feishu HTTP API to send the final report
+- phase A 会读取最近 `SCOUT_NOVELTY_LOOKBACK_DAYS` 的已选机会，提示模型优先避开同题材
+- 本地排序会对“与近期机会高度相似”的候选加惩罚分（同源域名/同主题词/同集群）
 
 Start scheduled task:
 

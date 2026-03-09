@@ -12,15 +12,107 @@ import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
-import httpx
-from dotenv import load_dotenv
+try:
+    import httpx
+except ImportError:
+    httpx = None
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv(*args, **kwargs):
+        return False
 
 
 PROJECT_ROOT = Path("/Users/cn/Workspace/feishu-bot-bridge")
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "reports" / "opportunity-scout"
 DEFAULT_JOB_LOCK_FILE = PROJECT_ROOT / ".state" / "opportunity_scout_job.lock"
 LOW_CONFIDENCE_LINE = "Confidence: Low — recent signals are weak today."
+DEFAULT_NOVELTY_LOOKBACK_DAYS = 3
+DEFAULT_NOVELTY_MAX_PENALTY = 0.7
+TOKEN_STOPWORDS = {
+    "there",
+    "their",
+    "about",
+    "after",
+    "before",
+    "while",
+    "with",
+    "from",
+    "this",
+    "that",
+    "into",
+    "been",
+    "were",
+    "have",
+    "has",
+    "had",
+    "your",
+    "they",
+    "them",
+    "will",
+    "would",
+    "could",
+    "should",
+    "what",
+    "when",
+    "where",
+    "which",
+    "than",
+    "then",
+    "very",
+    "more",
+    "most",
+    "just",
+    "into",
+    "only",
+}
+TOPIC_CLUSTER_KEYWORDS = {
+    "billing_pricing": [
+        "billing",
+        "price",
+        "pricing",
+        "charge",
+        "charged",
+        "invoice",
+        "checkout",
+        "refund",
+        "subscription",
+        "cancel",
+        "cancellation",
+        "plan",
+    ],
+    "content_seo": [
+        "seo",
+        "keyword",
+        "blog",
+        "article",
+        "content",
+        "newsletter",
+        "ugc",
+        "social",
+        "video",
+    ],
+    "agency_ops": [
+        "agency",
+        "client",
+        "proposal",
+        "reporting",
+        "manual",
+        "workflow",
+        "handoff",
+        "campaign",
+    ],
+    "crm_sales": [
+        "lead",
+        "pipeline",
+        "outreach",
+        "sales",
+        "crm",
+        "prospect",
+    ],
+}
 
 
 @dataclass
@@ -85,6 +177,8 @@ class Candidate:
 
 
 def _http_client(timeout_seconds: int = 180) -> httpx.Client:
+    if httpx is None:
+        raise RuntimeError("httpx is required for Feishu API calls.")
     return httpx.Client(timeout=timeout_seconds)
 
 
@@ -118,6 +212,121 @@ def _normalize_text(value: Any) -> str:
 def _normalize_url(value: Any) -> str:
     text = str(value or "").strip()
     return text if text.startswith("http://") or text.startswith("https://") else ""
+
+
+def _url_domain(url: str) -> str:
+    if not url:
+        return ""
+    try:
+        host = (urlparse(url).netloc or "").lower().strip()
+    except Exception:
+        return ""
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def _int_env(name: str, default_value: int, min_value: int, max_value: int) -> int:
+    raw = os.getenv(name, str(default_value)).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return default_value
+    return max(min_value, min(max_value, value))
+
+
+def _float_env(name: str, default_value: float, min_value: float, max_value: float) -> float:
+    raw = os.getenv(name, str(default_value)).strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return default_value
+    return max(min_value, min(max_value, value))
+
+
+def _text_tokens(text: str) -> set:
+    raw_tokens = re.findall(r"[a-z0-9]{3,}", text.lower())
+    return {token for token in raw_tokens if token not in TOKEN_STOPWORDS}
+
+
+def _topic_clusters(text: str) -> set:
+    lowered = text.lower()
+    clusters = set()
+    for cluster_name, keywords in TOPIC_CLUSTER_KEYWORDS.items():
+        if any(keyword in lowered for keyword in keywords):
+            clusters.add(cluster_name)
+    return clusters
+
+
+def _load_recent_context(cfg: Config, report_date: str) -> List[Dict[str, Any]]:
+    lookback_days = _int_env(
+        "SCOUT_NOVELTY_LOOKBACK_DAYS",
+        default_value=DEFAULT_NOVELTY_LOOKBACK_DAYS,
+        min_value=0,
+        max_value=14,
+    )
+    if lookback_days <= 0:
+        return []
+    try:
+        current_day = dt.date.fromisoformat(report_date)
+    except ValueError:
+        return []
+
+    recent_items: List[Dict[str, Any]] = []
+    if not cfg.output_dir.exists():
+        return recent_items
+
+    for path in sorted(cfg.output_dir.glob("*.json"), reverse=True):
+        date_key = path.stem
+        try:
+            day = dt.date.fromisoformat(date_key)
+        except ValueError:
+            continue
+        delta_days = (current_day - day).days
+        if delta_days <= 0 or delta_days > lookback_days:
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        ranked = payload.get("ranked_candidates")
+        if not isinstance(ranked, list) or not ranked:
+            continue
+        top = ranked[0]
+        candidate = top.get("candidate") if isinstance(top, dict) else None
+        if not isinstance(candidate, dict):
+            continue
+        idea_stub = _normalize_text(candidate.get("idea_stub"))
+        pain_point = _normalize_text(candidate.get("pain_point"))
+        gap = _normalize_text(candidate.get("gap"))
+        quote_url = _normalize_url(candidate.get("quote_url"))
+        trend_url = _normalize_url(candidate.get("trend_url"))
+        signature_text = f"{idea_stub} {pain_point} {gap}".strip()
+        if not signature_text:
+            continue
+        recent_items.append(
+            {
+                "report_date": date_key,
+                "idea_stub": idea_stub,
+                "quote_domain": _url_domain(quote_url),
+                "trend_domain": _url_domain(trend_url),
+                "theme_tokens": sorted(_text_tokens(signature_text)),
+                "clusters": sorted(_topic_clusters(signature_text)),
+            }
+        )
+    return recent_items
+
+
+def _recent_context_brief(recent_items: List[Dict[str, Any]], limit: int = 3) -> str:
+    lines: List[str] = []
+    for item in recent_items[:limit]:
+        quote_domain = item.get("quote_domain") or "-"
+        trend_domain = item.get("trend_domain") or "-"
+        lines.append(
+            f"- {item.get('report_date')}: {item.get('idea_stub', '')} "
+            f"(quote_domain={quote_domain}, trend_domain={trend_domain})"
+        )
+    return "\n".join(lines)
 
 
 def _coerce_score(value: Any) -> int:
@@ -189,6 +398,51 @@ def _rank_candidate(candidate: Candidate) -> float:
     score += _freshness_score(candidate) * 0.15
     score += _difficulty_modifier(candidate) * 0.05
     return round(score, 4)
+
+
+def _novelty_penalty(candidate: Candidate, recent_items: List[Dict[str, Any]]) -> float:
+    if not recent_items:
+        return 0.0
+
+    quote_domain = _url_domain(candidate.quote_url)
+    trend_domain = _url_domain(candidate.trend_url)
+    signature_text = f"{candidate.idea_stub} {candidate.pain_point} {candidate.gap}".strip()
+    candidate_tokens = _text_tokens(signature_text)
+    candidate_clusters = _topic_clusters(signature_text)
+
+    penalty = 0.0
+    for item in recent_items:
+        local_penalty = 0.0
+        if quote_domain and quote_domain == item.get("quote_domain"):
+            local_penalty += 0.18
+        if trend_domain and trend_domain == item.get("trend_domain"):
+            local_penalty += 0.10
+
+        previous_tokens = set(item.get("theme_tokens") or [])
+        if candidate_tokens and previous_tokens:
+            overlap_ratio = len(candidate_tokens & previous_tokens) / len(candidate_tokens | previous_tokens)
+            if overlap_ratio >= 0.45:
+                local_penalty += 0.30
+            elif overlap_ratio >= 0.30:
+                local_penalty += 0.18
+            elif overlap_ratio >= 0.20:
+                local_penalty += 0.10
+
+        previous_clusters = set(item.get("clusters") or [])
+        if candidate_clusters and previous_clusters:
+            shared_clusters = candidate_clusters & previous_clusters
+            if shared_clusters:
+                local_penalty += min(0.16, 0.08 * len(shared_clusters))
+
+        penalty = max(penalty, local_penalty)
+
+    max_penalty = _float_env(
+        "SCOUT_NOVELTY_MAX_PENALTY",
+        default_value=DEFAULT_NOVELTY_MAX_PENALTY,
+        min_value=0.0,
+        max_value=2.0,
+    )
+    return round(min(max_penalty, penalty), 4)
 
 
 def _validate_candidate(candidate: Candidate) -> None:
@@ -413,7 +667,17 @@ def _phase_b_schema() -> Dict[str, Any]:
     }
 
 
-def phase_a_hunt(cfg: Config, report_date: str) -> Dict[str, Any]:
+def phase_a_hunt(cfg: Config, report_date: str, recent_items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    recent_context = _recent_context_brief(recent_items)
+    novelty_block = (
+        "Recent selected opportunities (avoid near-duplicates unless today's evidence is significantly stronger):\n"
+        f"{recent_context}\n\n"
+        "Novelty requirement:\n"
+        "- Prefer a different root pain cluster and different source domains from the recent list.\n"
+        "- If you must stay in a similar cluster, explain in confidence_notes why today's signal is materially new.\n\n"
+        if recent_context
+        else ""
+    )
     prompt = (
         f"Today is {report_date}. You are Hunter, an autonomous business opportunity scout for Morning, "
         "a serial entrepreneur and software engineer running AfterWork Startup.\n\n"
@@ -433,6 +697,7 @@ def phase_a_hunt(cfg: Config, report_date: str) -> Dict[str, Any]:
         "3) Trend check:\n"
         "   - \"trending digital products 2026\"\n"
         "   - \"fastest growing SaaS categories February 2026\"\n\n"
+        f"{novelty_block}"
         "Rules:\n"
         "- Prefer evidence from the last 24-48 hours.\n"
         "- If a supporting trend source needs to be older, allow up to 7 days and mark freshness as weak.\n"
@@ -531,12 +796,38 @@ def _is_low_confidence(candidates: List[Candidate], selected: Candidate) -> bool
     return False
 
 
-def _sorted_candidates(candidates: List[Candidate]) -> List[Dict[str, Any]]:
+def _sorted_candidates(candidates: List[Candidate], recent_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     ranked: List[Dict[str, Any]] = []
     for candidate in candidates:
-        ranked.append({"candidate": candidate, "score": _rank_candidate(candidate)})
-    ranked.sort(key=lambda item: item["score"], reverse=True)
+        base_score = _rank_candidate(candidate)
+        novelty_penalty = _novelty_penalty(candidate, recent_items)
+        final_score = round(base_score - novelty_penalty, 4)
+        ranked.append(
+            {
+                "candidate": candidate,
+                "base_score": base_score,
+                "novelty_penalty": novelty_penalty,
+                "score": final_score,
+            }
+        )
+    ranked.sort(key=lambda item: (item["score"], item["base_score"]), reverse=True)
     return ranked
+
+
+def _pick_best_candidate(ranked_candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not ranked_candidates:
+        raise ValueError("No ranked candidates to select.")
+    top = ranked_candidates[0]
+    top_penalty = float(top.get("novelty_penalty") or 0.0)
+    if top_penalty <= 0.35:
+        return top
+    top_score = float(top.get("score") or 0.0)
+    for item in ranked_candidates[1:]:
+        candidate_penalty = float(item.get("novelty_penalty") or 0.0)
+        candidate_score = float(item.get("score") or 0.0)
+        if candidate_penalty + 0.12 < top_penalty and (top_score - candidate_score) <= 0.25:
+            return item
+    return top
 
 
 def _split_text(text: str, max_len: int = 2600) -> List[str]:
@@ -611,6 +902,7 @@ def write_outputs(
     phase_a: Dict[str, Any],
     phase_b: Dict[str, Any],
     ranked_candidates: List[Dict[str, Any]],
+    recent_items: List[Dict[str, Any]],
     low_confidence: bool,
 ) -> Dict[str, Path]:
     cfg.output_dir.mkdir(parents=True, exist_ok=True)
@@ -627,7 +919,20 @@ def write_outputs(
             "codex_cmd": cfg.codex_cmd,
             "codex_model": cfg.codex_model,
             "codex_timeout_sec": cfg.codex_timeout_sec,
+            "novelty_lookback_days": _int_env(
+                "SCOUT_NOVELTY_LOOKBACK_DAYS",
+                default_value=DEFAULT_NOVELTY_LOOKBACK_DAYS,
+                min_value=0,
+                max_value=14,
+            ),
+            "novelty_max_penalty": _float_env(
+                "SCOUT_NOVELTY_MAX_PENALTY",
+                default_value=DEFAULT_NOVELTY_MAX_PENALTY,
+                min_value=0.0,
+                max_value=2.0,
+            ),
         },
+        "recent_context": recent_items,
         "phase_a": {
             "parsed": phase_a["parsed"],
             "sources": phase_a["sources"],
@@ -638,6 +943,8 @@ def write_outputs(
         "ranked_candidates": [
             {
                 "score": item["score"],
+                "base_score": item.get("base_score"),
+                "novelty_penalty": item.get("novelty_penalty"),
                 "candidate": asdict(item["candidate"]),
             }
             for item in ranked_candidates
@@ -675,11 +982,18 @@ def run(
         cfg = Config.from_env()
         if not shutil.which(cfg.codex_cmd) and not (mock_hunt_file and mock_report_file):
             raise RuntimeError(f"Codex command not found: {cfg.codex_cmd}")
-        phase_a = _load_mock_hunt_file(mock_hunt_file) if mock_hunt_file else phase_a_hunt(cfg, report_date)
+        recent_items = _load_recent_context(cfg, report_date)
+        phase_a = (
+            _load_mock_hunt_file(mock_hunt_file)
+            if mock_hunt_file
+            else phase_a_hunt(cfg, report_date, recent_items)
+        )
         candidates = _parse_candidates(phase_a["parsed"])
-        ranked_candidates = _sorted_candidates(candidates)
-        selected = ranked_candidates[0]["candidate"]
-        low_confidence = _is_low_confidence(candidates, selected)
+        ranked_candidates = _sorted_candidates(candidates, recent_items)
+        selected_item = _pick_best_candidate(ranked_candidates)
+        selected = selected_item["candidate"]
+        selected_novelty_penalty = float(selected_item.get("novelty_penalty") or 0.0)
+        low_confidence = _is_low_confidence(candidates, selected) or selected_novelty_penalty >= 0.45
         if cfg.fallback_policy != "send_low_confidence" and low_confidence:
             raise RuntimeError(f"Unsupported fallback policy: {cfg.fallback_policy}")
         phase_b = (
@@ -689,12 +1003,21 @@ def run(
         )
         markdown = build_report_markdown(report_date, phase_b["parsed"], selected, low_confidence)
         _validate_report_markdown(markdown)
-        outputs = write_outputs(cfg, report_date, markdown, phase_a, phase_b, ranked_candidates, low_confidence)
+        outputs = write_outputs(
+            cfg,
+            report_date,
+            markdown,
+            phase_a,
+            phase_b,
+            ranked_candidates,
+            recent_items,
+            low_confidence,
+        )
         title = f"【Low Confidence】{report_date}" if low_confidence else report_date
         send_to_feishu(cfg, title, markdown, dry_run=dry_run)
         return {
             "outputs": outputs,
-            "selected_score": ranked_candidates[0]["score"],
+            "selected_score": selected_item["score"],
             "low_confidence": low_confidence,
             "send_open_id": cfg.send_open_id,
         }
