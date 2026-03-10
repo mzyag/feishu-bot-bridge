@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path("/Users/cn/Workspace/feishu-bot-bridge")
 DEFAULT_WORKSPACE = Path("/Users/cn/Workspace")
 SESSION_TO_MEMORY_SCRIPT = Path("/Users/cn/.codex/skills/session-memory-workspace/scripts/session-to-memory.js")
-DEFAULT_DAILY_REPORT_SCOPES = ["codex_snapshot", "work_snapshot"]
+DEFAULT_DAILY_REPORT_SCOPES = ["session_summary", "codex_snapshot", "work_snapshot"]
 
 
 def _parse_report_scopes(raw: str) -> List[str]:
@@ -296,6 +296,88 @@ def _find_issues(messages: List[Dict[str, str]]) -> List[str]:
     return issues
 
 
+def _clip_text(text: str, limit: int = 64) -> str:
+    compact = re.sub(r"\s+", " ", text).strip()
+    if len(compact) <= limit:
+        return compact
+    return compact[:limit] + "..."
+
+
+def _classify_issue_topics(issues: List[str]) -> List[str]:
+    topic_rules: List[Tuple[str, List[str]]] = [
+        ("依赖与环境", ["module not found", "依赖", "pip", "install", "python-multipart", "email-validator"]),
+        ("权限与沙箱", ["operation not permitted", "permission", "只读", "blocked by policy", "sandbox"]),
+        ("网络与连接", ["timeout", "no connection", "连接", "network", "url_error", "dns"]),
+        ("兼容性", ["不支持", "unsupported", "python 3.9", "type annotation", "eval_type_backport"]),
+        ("业务逻辑", ["报错", "错误", "失败", "异常", "bug", "回归"]),
+    ]
+    topic_count: Dict[str, int] = {}
+    for issue in issues:
+        low = issue.lower()
+        for topic, keywords in topic_rules:
+            if any(k in low for k in keywords):
+                topic_count[topic] = topic_count.get(topic, 0) + 1
+
+    if not topic_count:
+        return ["流程稳定性"]
+    ranked = sorted(topic_count.items(), key=lambda x: (-x[1], x[0]))
+    return [topic for topic, _ in ranked[:2]]
+
+
+def _build_reflection_lines(
+    report_date: str,
+    session_count: int,
+    total_msgs: int,
+    issues: List[str],
+    outcomes: List[str],
+    work_snapshot: Dict[str, Any],
+) -> List[str]:
+    reflection: List[str] = []
+    if issues:
+        topics = "、".join(_classify_issue_topics(issues))
+        reflection.append(f"{report_date} 共识别 {len(issues)} 条异常信号，主要集中在 {topics}，应先做预检再跑主链路。")
+        reflection.append(f"当日典型异常：{_clip_text(issues[0], 56)}")
+        if outcomes:
+            reflection.append(f"在排障同时仍产出 {len(outcomes)} 条结果，后续需把修复步骤固化为可复用脚本。")
+        else:
+            reflection.append("当天结果产出偏少，后续应把“排障”和“交付”拆成并行动作，避免整链路阻塞。")
+        return reflection
+
+    reflection.append(f"{report_date} 会话 {session_count}、消息 {total_msgs}，未检索到明显错误关键词，链路整体稳定。")
+    if outcomes:
+        reflection.append(f"已沉淀 {len(outcomes)} 条执行结果，下一步应把高频动作模板化，减少重复劳动。")
+    else:
+        reflection.append("执行结果描述偏少，后续需在关键节点补充结构化结果记录，提升复盘质量。")
+    if work_snapshot.get("is_git_repo"):
+        dirty_count = len(work_snapshot.get("status_items", []) or [])
+        if dirty_count:
+            reflection.append(f"当前工作区仍有 {dirty_count} 项未提交改动，建议按功能拆分提交并补最小回归验证。")
+        else:
+            reflection.append("当前工作区无未提交改动，建议保持“小步提交 + 每步验证”的节奏。")
+    else:
+        reflection.append("当前目录非 Git 仓库或状态不可用，建议关键交付默认纳入版本管理。")
+    return reflection
+
+
+def _build_next_actions(issues: List[str], work_snapshot: Dict[str, Any]) -> List[str]:
+    if issues:
+        actions = [
+            "先把今日高频异常整理成“启动前预检清单”（依赖、权限、网络、配置）并在任务开始前执行。",
+            "针对今日首个异常补一条自动化回归，明天执行一次端到端复跑并记录结果。",
+        ]
+    else:
+        actions = [
+            "沿用当前稳定链路，优先推进未闭环事项并保持每步留痕（日志/产出）。",
+            "对关键流程执行一次抽样回归（接收 -> 处理 -> 回发 -> 记录），确认稳定性。",
+        ]
+
+    if work_snapshot.get("is_git_repo"):
+        dirty_count = len(work_snapshot.get("status_items", []) or [])
+        if dirty_count:
+            actions.append("清理当前未提交改动：按功能拆分提交并补齐最小验证说明。")
+    return actions
+
+
 def _resolve_state_path(raw_path: str) -> Path:
     path = Path(os.path.expanduser(raw_path))
     if path.is_absolute():
@@ -407,17 +489,15 @@ def build_report_markdown(
     total_msgs = len(messages)
     user_count = sum(1 for m in messages if m["role"] == "user")
     assistant_count = sum(1 for m in messages if m["role"] == "assistant")
-
-    reflection = [
-        "对模型、账号、外部 API 的可用性先做最小连通测试，再切到自动化链路。",
-        "事件驱动消息默认启用幂等去重与结构化日志，避免重复投递带来的双动作。",
-        "进程统一由 launchd 托管，避免手工多实例导致状态漂移。",
-    ]
-    if not issues:
-        reflection = [
-            "今天整体链路稳定，继续保持变更后即时验证和日志核对。",
-            "后续优先优化响应速度与日志可读性，缩短排障时间。",
-        ]
+    reflection = _build_reflection_lines(
+        report_date=report_date,
+        session_count=session_count,
+        total_msgs=total_msgs,
+        issues=issues,
+        outcomes=outcomes,
+        work_snapshot=work_snapshot,
+    )
+    next_actions = _build_next_actions(issues=issues, work_snapshot=work_snapshot)
 
     lines: List[str] = []
     lines.append(f"# 日报（{report_date}）")
@@ -491,22 +571,21 @@ def build_report_markdown(
                 lines.append(f"- {err}")
         lines.append("")
 
-    if "session_summary" in enabled_scopes:
-        lines.append("## 问题与异常")
-        if issues:
-            for i in issues:
-                lines.append(f"- {i}")
-        else:
-            lines.append("- 未发现明显错误关键词。")
-        lines.append("")
-        lines.append("## 反思与改进")
-        for r in reflection:
-            lines.append(f"- {r}")
-        lines.append("")
-        lines.append("## 明日行动")
-        lines.append("- 按优先级执行未闭环事项，并在完成后更新日志与记忆。")
-        lines.append("- 对关键链路执行一次端到端回归（接收 -> 处理 -> 回发 -> 日志）。")
-        lines.append("")
+    lines.append("## 问题与异常")
+    if issues:
+        for i in issues:
+            lines.append(f"- {i}")
+    else:
+        lines.append("- 未发现明显错误关键词。")
+    lines.append("")
+    lines.append("## 反思与改进")
+    for r in reflection:
+        lines.append(f"- {r}")
+    lines.append("")
+    lines.append("## 明日行动")
+    for action in next_actions:
+        lines.append(f"- {action}")
+    lines.append("")
 
     return "\n".join(lines)
 

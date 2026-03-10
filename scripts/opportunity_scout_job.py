@@ -171,6 +171,13 @@ class Candidate:
     solo_build_fit: int
     distribution_leverage: int
     boring_b2b_score: int
+    pay_signal_strength: int
+    persona: str
+    workflow_frequency: str
+    current_spend_or_workaround: str
+    switch_trigger: str
+    must_have_capability: str
+    gtm_channel_fit: str
     difficulty: str
     freshness: str
     confidence_notes: str
@@ -380,6 +387,37 @@ def _pain_severity_score(candidate: Candidate) -> float:
     return min(5.0, score)
 
 
+def _workflow_frequency_score(candidate: Candidate) -> float:
+    text = candidate.workflow_frequency.lower()
+    if any(token in text for token in ["daily", "every day", "per day", "multiple times a day"]):
+        return 5.0
+    if any(token in text for token in ["weekly", "every week", "several times a week"]):
+        return 4.2
+    if any(token in text for token in ["biweekly", "twice a month"]):
+        return 3.4
+    if "monthly" in text:
+        return 2.6
+    return 3.0
+
+
+def _pay_signal_score(candidate: Candidate) -> float:
+    score = float(candidate.pay_signal_strength)
+    spend_text = candidate.current_spend_or_workaround.lower()
+    if re.search(r"\$|usd|dollar|pay|paying|subscription|license|agency|freelancer", spend_text):
+        score += 0.6
+    if re.search(r"hour|hours|manual|spreadsheet|excel|notion|copy paste|outsource|contractor", spend_text):
+        score += 0.4
+    if len(candidate.switch_trigger) >= 24:
+        score += 0.2
+    if len(candidate.must_have_capability) >= 24:
+        score += 0.2
+    return max(1.0, min(5.0, score))
+
+
+def _commercial_clarity_score(candidate: Candidate) -> float:
+    return round((_pay_signal_score(candidate) * 0.65) + (_workflow_frequency_score(candidate) * 0.35), 4)
+
+
 def _freshness_score(candidate: Candidate) -> float:
     return 5.0 if candidate.freshness == "strong" else 2.0
 
@@ -389,15 +427,53 @@ def _difficulty_modifier(candidate: Candidate) -> float:
     return mapping.get(candidate.difficulty, 0.7)
 
 
-def _rank_candidate(candidate: Candidate) -> float:
+def _founder_fit_penalty(candidate: Candidate) -> float:
+    text = " ".join(
+        [
+            candidate.idea_stub,
+            candidate.pain_point,
+            candidate.gap,
+            candidate.persona,
+            candidate.confidence_notes,
+        ]
+    ).lower()
+    risky_keywords = [
+        "hardware",
+        "factory",
+        "manufacturing",
+        "marketplace",
+        "fleet",
+        "medical device",
+        "biotech",
+        "multi-sided",
+        "field sales team",
+    ]
+    return 0.4 if any(keyword in text for keyword in risky_keywords) else 0.0
+
+
+def _rank_candidate(candidate: Candidate) -> Dict[str, float]:
+    pain = _pain_severity_score(candidate)
+    freshness = _freshness_score(candidate)
+    commercial = _commercial_clarity_score(candidate)
+    difficulty_mod = _difficulty_modifier(candidate)
+    fit_penalty = _founder_fit_penalty(candidate)
     score = 0.0
-    score += _pain_severity_score(candidate) * 0.30
-    score += candidate.solo_build_fit * 0.20
-    score += candidate.distribution_leverage * 0.20
-    score += candidate.boring_b2b_score * 0.15
-    score += _freshness_score(candidate) * 0.15
-    score += _difficulty_modifier(candidate) * 0.05
-    return round(score, 4)
+    score += pain * 0.27
+    score += candidate.solo_build_fit * 0.18
+    score += candidate.distribution_leverage * 0.17
+    score += candidate.boring_b2b_score * 0.13
+    score += commercial * 0.15
+    score += freshness * 0.10
+    score += difficulty_mod * 0.05
+    score -= fit_penalty
+    return {
+        "total": round(score, 4),
+        "pain": round(pain, 4),
+        "freshness": round(freshness, 4),
+        "commercial_clarity": round(commercial, 4),
+        "difficulty_mod": round(difficulty_mod, 4),
+        "fit_penalty": round(fit_penalty, 4),
+    }
 
 
 def _novelty_penalty(candidate: Candidate, recent_items: List[Dict[str, Any]]) -> float:
@@ -451,6 +527,12 @@ def _validate_candidate(candidate: Candidate) -> None:
         candidate.pain_point,
         candidate.user_quote,
         candidate.gap,
+        candidate.persona,
+        candidate.workflow_frequency,
+        candidate.current_spend_or_workaround,
+        candidate.switch_trigger,
+        candidate.must_have_capability,
+        candidate.gtm_channel_fit,
         candidate.trend_source,
         candidate.confidence_notes,
     ]
@@ -480,6 +562,13 @@ def _parse_candidates(payload: Dict[str, Any]) -> List[Candidate]:
             solo_build_fit=_coerce_score(item.get("solo_build_fit")),
             distribution_leverage=_coerce_score(item.get("distribution_leverage")),
             boring_b2b_score=_coerce_score(item.get("boring_b2b_score")),
+            pay_signal_strength=_coerce_score(item.get("pay_signal_strength")),
+            persona=_normalize_text(item.get("persona")),
+            workflow_frequency=_normalize_text(item.get("workflow_frequency")),
+            current_spend_or_workaround=_normalize_text(item.get("current_spend_or_workaround")),
+            switch_trigger=_normalize_text(item.get("switch_trigger")),
+            must_have_capability=_normalize_text(item.get("must_have_capability")),
+            gtm_channel_fit=_normalize_text(item.get("gtm_channel_fit")),
             difficulty=_normalize_difficulty(item.get("difficulty")),
             freshness=_normalize_freshness(item.get("freshness")),
             confidence_notes=_normalize_text(item.get("confidence_notes")),
@@ -589,6 +678,13 @@ def _phase_a_schema() -> Dict[str, Any]:
             "solo_build_fit": {"type": "integer", "minimum": 1, "maximum": 5},
             "distribution_leverage": {"type": "integer", "minimum": 1, "maximum": 5},
             "boring_b2b_score": {"type": "integer", "minimum": 1, "maximum": 5},
+            "pay_signal_strength": {"type": "integer", "minimum": 1, "maximum": 5},
+            "persona": {"type": "string"},
+            "workflow_frequency": {"type": "string"},
+            "current_spend_or_workaround": {"type": "string"},
+            "switch_trigger": {"type": "string"},
+            "must_have_capability": {"type": "string"},
+            "gtm_channel_fit": {"type": "string"},
             "difficulty": {"type": "string"},
             "freshness": {"type": "string"},
             "confidence_notes": {"type": "string"},
@@ -605,6 +701,13 @@ def _phase_a_schema() -> Dict[str, Any]:
             "solo_build_fit",
             "distribution_leverage",
             "boring_b2b_score",
+            "pay_signal_strength",
+            "persona",
+            "workflow_frequency",
+            "current_spend_or_workaround",
+            "switch_trigger",
+            "must_have_capability",
+            "gtm_channel_fit",
             "difficulty",
             "freshness",
             "confidence_notes",
@@ -667,7 +770,13 @@ def _phase_b_schema() -> Dict[str, Any]:
     }
 
 
-def phase_a_hunt(cfg: Config, report_date: str, recent_items: List[Dict[str, Any]]) -> Dict[str, Any]:
+def phase_a_hunt(
+    cfg: Config,
+    report_date: str,
+    recent_items: List[Dict[str, Any]],
+    avoidance_block: str = "",
+    round_label: str = "",
+) -> Dict[str, Any]:
     recent_context = _recent_context_brief(recent_items)
     novelty_block = (
         "Recent selected opportunities (avoid near-duplicates unless today's evidence is significantly stronger):\n"
@@ -678,9 +787,11 @@ def phase_a_hunt(cfg: Config, report_date: str, recent_items: List[Dict[str, Any
         if recent_context
         else ""
     )
+    round_context = f"Hunt round: {round_label}\n\n" if round_label else ""
     prompt = (
         f"Today is {report_date}. You are Hunter, an autonomous business opportunity scout for Morning, "
         "a serial entrepreneur and software engineer running AfterWork Startup.\n\n"
+        f"{round_context}"
         "Mission:\n"
         "- Browse the live web and find real software pain.\n"
         "- Only surface opportunities suited to micro-SaaS, AI wrappers, programmatic SEO, or high-end digital downloads.\n"
@@ -698,21 +809,115 @@ def phase_a_hunt(cfg: Config, report_date: str, recent_items: List[Dict[str, Any
         "   - \"trending digital products 2026\"\n"
         "   - \"fastest growing SaaS categories February 2026\"\n\n"
         f"{novelty_block}"
+        f"{avoidance_block}"
         "Rules:\n"
         "- Prefer evidence from the last 24-48 hours.\n"
         "- If a supporting trend source needs to be older, allow up to 7 days and mark freshness as weak.\n"
         "- Return 6-10 candidates when possible.\n"
         "- Every candidate must include a real complaint quote or a very short faithful paraphrase, a complaint URL, and a trend URL.\n"
+        "- For each candidate include ICP/commercial evidence fields:\n"
+        "  persona, workflow_frequency, current_spend_or_workaround, switch_trigger, must_have_capability, gtm_channel_fit.\n"
+        "- pay_signal_strength (1-5) must reflect explicit willingness to pay, current paid workaround, or clear time-to-money pain.\n"
         "- Score solo_build_fit, distribution_leverage, and boring_b2b_score from 1 to 5.\n"
         "- Use difficulty values Low, Medium, or High.\n"
         "- Use freshness values strong or weak.\n"
     )
-    response_json = _run_codex_json(cfg, prompt, _phase_a_schema(), "phase-a")
+    phase_name = f"phase-a-{round_label}" if round_label else "phase-a"
+    response_json = _run_codex_json(cfg, prompt, _phase_a_schema(), phase_name)
     parsed = response_json["parsed"]
     return {
         "parsed": parsed,
-        "response": response_json,
+        "response": response_json.get("response", {}),
         "sources": _sources_from_candidates(parsed),
+    }
+
+
+def _candidate_signature_raw(item: Dict[str, Any]) -> str:
+    quote_url = _normalize_url(item.get("quote_url")).lower()
+    if quote_url:
+        return f"url::{quote_url}"
+    idea = _normalize_text(item.get("idea_stub")).lower()
+    pain = _normalize_text(item.get("pain_point")).lower()
+    return f"text::{idea[:120]}::{pain[:180]}"
+
+
+def _avoidance_block_from_candidates(raw_candidates: List[Dict[str, Any]], limit: int = 8) -> str:
+    if not raw_candidates:
+        return ""
+    lines = []
+    for index, item in enumerate(raw_candidates[:limit], start=1):
+        idea = _normalize_text(item.get("idea_stub")) or "(untitled)"
+        quote_url = _normalize_url(item.get("quote_url")) or "no-url"
+        lines.append(f"- {index}. {idea} ({quote_url})")
+    joined = "\n".join(lines)
+    return (
+        "Already accepted in earlier rounds (avoid duplicates or near-duplicates):\n"
+        f"{joined}\n\n"
+        "Round diversity rule:\n"
+        "- Prefer different source URLs and pain framing from the list above.\n"
+        "- Do not repeat the same complaint URL.\n\n"
+    )
+
+
+def phase_a_hunt_multi(cfg: Config, report_date: str, recent_items: List[Dict[str, Any]]) -> Dict[str, Any]:
+    rounds = _int_env("SCOUT_HUNT_ROUNDS", default_value=1, min_value=1, max_value=5)
+    accepted_raw_candidates: List[Dict[str, Any]] = []
+    seen_signatures = set()
+    round_meta: List[Dict[str, Any]] = []
+    search_window_values: List[str] = []
+
+    for round_index in range(1, rounds + 1):
+        avoidance_block = _avoidance_block_from_candidates(accepted_raw_candidates)
+        round_result = phase_a_hunt(
+            cfg=cfg,
+            report_date=report_date,
+            recent_items=recent_items,
+            avoidance_block=avoidance_block,
+            round_label=f"{round_index}of{rounds}",
+        )
+        parsed = round_result.get("parsed") or {}
+        search_window = _normalize_text(parsed.get("search_window"))
+        if search_window:
+            search_window_values.append(search_window)
+        raw_candidates = parsed.get("candidates")
+        if not isinstance(raw_candidates, list):
+            raw_candidates = []
+
+        accepted_count = 0
+        for item in raw_candidates:
+            if not isinstance(item, dict):
+                continue
+            signature = _candidate_signature_raw(item)
+            if signature in seen_signatures:
+                continue
+            seen_signatures.add(signature)
+            accepted_raw_candidates.append(item)
+            accepted_count += 1
+
+        round_meta.append(
+            {
+                "round": round_index,
+                "requested_rounds": rounds,
+                "raw_candidates": len(raw_candidates),
+                "accepted_candidates": accepted_count,
+                "response": round_result.get("response", {}),
+            }
+        )
+
+    if not accepted_raw_candidates:
+        raise RuntimeError("Phase A multi-round hunt returned no valid candidates.")
+
+    merged_search_window = " | ".join(search_window_values) if search_window_values else report_date
+    merged_parsed = {"search_window": merged_search_window, "candidates": accepted_raw_candidates}
+    return {
+        "parsed": merged_parsed,
+        "response": {
+            "runner": "codex_cli_multi_round",
+            "rounds": round_meta,
+            "round_count": rounds,
+            "unique_candidates": len(accepted_raw_candidates),
+        },
+        "sources": _sources_from_candidates(merged_parsed),
     }
 
 
@@ -727,6 +932,8 @@ def phase_b_report(cfg: Config, report_date: str, candidate: Candidate, low_conf
         "- Describe exactly one opportunity.\n"
         "- Maintain founder fit for a software engineer building a boring-but-profitable software business.\n"
         "- The idea should be sellable via SEO, short-form content, or simple outbound-free channels.\n"
+        "- Explicitly mention target ICP and why they will pay now.\n"
+        "- No claim without URL-backed evidence in selected candidate.\n"
         f"- Confidence target: {confidence_target}.\n"
         "- If confidence is low, explain why in one sentence.\n\n"
         f"Report date: {report_date}\n"
@@ -738,7 +945,7 @@ def phase_b_report(cfg: Config, report_date: str, candidate: Candidate, low_conf
     parsed = response_json["parsed"]
     return {
         "parsed": parsed,
-        "response": response_json,
+        "response": response_json.get("response", {}),
     }
 
 
@@ -786,12 +993,23 @@ def _validate_report_markdown(markdown: str) -> None:
         raise ValueError("Generated report must include a user quote.")
 
 
-def _is_low_confidence(candidates: List[Candidate], selected: Candidate) -> bool:
+def _is_low_confidence(candidates: List[Candidate], selected: Candidate, selected_item: Dict[str, Any]) -> bool:
+    min_pay_signal = _int_env("SCOUT_MIN_PAY_SIGNAL", default_value=3, min_value=1, max_value=5)
+    min_commercial_score = _float_env("SCOUT_MIN_COMMERCIAL_SCORE", default_value=3.0, min_value=1.0, max_value=5.0)
+    commercial_score = float(selected_item.get("commercial_clarity") or _commercial_clarity_score(selected))
     if len(candidates) < 6:
         return True
     if selected.freshness != "strong":
         return True
     if selected.solo_build_fit <= 2 or selected.distribution_leverage <= 2:
+        return True
+    if selected.pay_signal_strength < min_pay_signal:
+        return True
+    if commercial_score < min_commercial_score:
+        return True
+    if selected.boring_b2b_score <= 2:
+        return True
+    if _founder_fit_penalty(selected) > 0:
         return True
     return False
 
@@ -799,7 +1017,8 @@ def _is_low_confidence(candidates: List[Candidate], selected: Candidate) -> bool
 def _sorted_candidates(candidates: List[Candidate], recent_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     ranked: List[Dict[str, Any]] = []
     for candidate in candidates:
-        base_score = _rank_candidate(candidate)
+        score_info = _rank_candidate(candidate)
+        base_score = float(score_info["total"])
         novelty_penalty = _novelty_penalty(candidate, recent_items)
         final_score = round(base_score - novelty_penalty, 4)
         ranked.append(
@@ -808,6 +1027,11 @@ def _sorted_candidates(candidates: List[Candidate], recent_items: List[Dict[str,
                 "base_score": base_score,
                 "novelty_penalty": novelty_penalty,
                 "score": final_score,
+                "pain_score": score_info["pain"],
+                "freshness_score": score_info["freshness"],
+                "commercial_clarity": score_info["commercial_clarity"],
+                "difficulty_modifier": score_info["difficulty_mod"],
+                "fit_penalty": score_info["fit_penalty"],
             }
         )
     ranked.sort(key=lambda item: (item["score"], item["base_score"]), reverse=True)
@@ -931,12 +1155,23 @@ def write_outputs(
                 min_value=0.0,
                 max_value=2.0,
             ),
+            "min_pay_signal": _int_env("SCOUT_MIN_PAY_SIGNAL", default_value=3, min_value=1, max_value=5),
+            "min_commercial_score": _float_env(
+                "SCOUT_MIN_COMMERCIAL_SCORE",
+                default_value=3.0,
+                min_value=1.0,
+                max_value=5.0,
+            ),
+            "hunt_rounds": _int_env("SCOUT_HUNT_ROUNDS", default_value=1, min_value=1, max_value=5),
         },
         "recent_context": recent_items,
         "phase_a": {
             "parsed": phase_a["parsed"],
             "sources": phase_a["sources"],
             "runner": phase_a["response"].get("runner"),
+            "round_count": phase_a["response"].get("round_count"),
+            "unique_candidates": phase_a["response"].get("unique_candidates"),
+            "rounds": phase_a["response"].get("rounds"),
             "stdout_tail": phase_a["response"].get("stdout_tail"),
             "stderr_tail": phase_a["response"].get("stderr_tail"),
         },
@@ -945,6 +1180,11 @@ def write_outputs(
                 "score": item["score"],
                 "base_score": item.get("base_score"),
                 "novelty_penalty": item.get("novelty_penalty"),
+                "pain_score": item.get("pain_score"),
+                "freshness_score": item.get("freshness_score"),
+                "commercial_clarity": item.get("commercial_clarity"),
+                "difficulty_modifier": item.get("difficulty_modifier"),
+                "fit_penalty": item.get("fit_penalty"),
                 "candidate": asdict(item["candidate"]),
             }
             for item in ranked_candidates
@@ -963,12 +1203,16 @@ def write_outputs(
 
 def _load_mock_hunt_file(path: Path) -> Dict[str, Any]:
     raw = json.loads(path.read_text(encoding="utf-8"))
-    return {"parsed": raw, "response": {"id": "mock-phase-a"}, "sources": []}
+    return {
+        "parsed": raw,
+        "response": {"runner": "mock", "round_count": 1, "unique_candidates": len(raw.get("candidates") or [])},
+        "sources": _sources_from_candidates(raw),
+    }
 
 
 def _load_mock_report_file(path: Path) -> Dict[str, Any]:
     raw = json.loads(path.read_text(encoding="utf-8"))
-    return {"parsed": raw, "response": {"id": "mock-phase-b"}}
+    return {"parsed": raw, "response": {"runner": "mock"}}
 
 
 def run(
@@ -986,14 +1230,14 @@ def run(
         phase_a = (
             _load_mock_hunt_file(mock_hunt_file)
             if mock_hunt_file
-            else phase_a_hunt(cfg, report_date, recent_items)
+            else phase_a_hunt_multi(cfg, report_date, recent_items)
         )
         candidates = _parse_candidates(phase_a["parsed"])
         ranked_candidates = _sorted_candidates(candidates, recent_items)
         selected_item = _pick_best_candidate(ranked_candidates)
         selected = selected_item["candidate"]
         selected_novelty_penalty = float(selected_item.get("novelty_penalty") or 0.0)
-        low_confidence = _is_low_confidence(candidates, selected) or selected_novelty_penalty >= 0.45
+        low_confidence = _is_low_confidence(candidates, selected, selected_item) or selected_novelty_penalty >= 0.45
         if cfg.fallback_policy != "send_low_confidence" and low_confidence:
             raise RuntimeError(f"Unsupported fallback policy: {cfg.fallback_policy}")
         phase_b = (

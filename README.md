@@ -155,6 +155,9 @@ Configure in `.env`:
 - `SCOUT_FALLBACK_POLICY=send_low_confidence`
 - `SCOUT_NOVELTY_LOOKBACK_DAYS=3` (去重参考天数，读取最近报告做“题材去重”)
 - `SCOUT_NOVELTY_MAX_PENALTY=0.7` (新颖性惩罚上限，越大越倾向避开重复题材)
+- `SCOUT_MIN_PAY_SIGNAL=3` (最低付费信号分；低于阈值自动降级为 Low Confidence)
+- `SCOUT_MIN_COMMERCIAL_SCORE=3.0` (最低商业清晰度分；综合“付费信号+任务频率”)
+- `SCOUT_HUNT_ROUNDS=1` (Phase A 调研轮次；>1 时会多轮检索并合并去重后再选最高分)
 - `SCOUT_OUTPUT_DIR=${PROJECT_DIR}/reports/opportunity-scout`
 - `SCOUT_JOB_LOCK_FILE=${PROJECT_DIR}/.state/opportunity_scout_job.lock` (防并发重跑)
 - `SCOUT_WATCHDOG_INTERVAL_SEC=360` (boot 后每 6 分钟巡检一次)
@@ -169,6 +172,9 @@ Runtime behavior:
 - still uses Feishu HTTP API to send the final report
 - phase A 会读取最近 `SCOUT_NOVELTY_LOOKBACK_DAYS` 的已选机会，提示模型优先避开同题材
 - 本地排序会对“与近期机会高度相似”的候选加惩罚分（同源域名/同主题词/同集群）
+- phase A 额外提取 ICP/付费信号字段（persona、frequency、current spend/workaround、switch trigger）
+- 本地评分增加商业可行性维度，优先“有明确付费动机 + 高频痛点 + 单人可交付”的机会
+- 当 `SCOUT_HUNT_ROUNDS>1` 时：执行多轮调研、按 URL/题材去重、统一排序，仅输出最高分机会报告
 
 Start scheduled task:
 
@@ -207,6 +213,136 @@ Task outputs:
 
 - markdown report: `reports/opportunity-scout/YYYY-MM-DD.md`
 - research JSON: `reports/opportunity-scout/YYYY-MM-DD.json`
+
+## 3.3 Xiaohongshu AI Blogger Daily Ops (Feishu + Local Codex)
+
+Configure in `.env`:
+
+- `XHS_REPORT_HOUR` / `XHS_REPORT_MINUTE` (default `09:00`)
+- `XHS_SEND_OPEN_ID` (if empty, fallback to `DAILY_REPORT_SEND_OPEN_ID`, then first `ALLOWED_USER_IDS`)
+- `XHS_CODEX_MODEL` (optional; fallback to `CODEX_MODEL`)
+- `XHS_CODEX_TIMEOUT_SEC` (default `900`)
+- `XHS_NICHE` / `XHS_TARGET_PERSONA` / `XHS_MONETIZATION_GOAL`
+- `XHS_BRAND_VOICE` (daily note writing tone)
+- `XHS_PUBLISH_WINDOWS=12:30,18:30,21:30`
+- `XHS_MAX_POSTS_PER_DAY` / `XHS_MAX_COMMENTS_PER_DAY`
+- `XHS_COMMENTS_PER_TOPIC=2`
+- `XHS_SIGNAL_MIN_COUNT` (below threshold => `Low Confidence`)
+- `XHS_FALLBACK_POLICY=send_low_confidence`
+- `XHS_OUTPUT_DIR=${PROJECT_DIR}/reports/xhs-ai-blogger`
+- `XHS_COVER_ENABLED=true` (固定单图封面发布链路开关)
+- `XHS_COVER_OUTPUT_DIR=${PROJECT_DIR}/reports/xhs-ai-blogger/assets`
+- `XHS_COVER_TEMPLATE=minimal_v1`
+- `XHS_COVER_SCRIPT=${PROJECT_DIR}/scripts/xhs_cover_generator.py`
+- `XHS_COVER_PROVIDER=auto|codex_skill|local`（默认 `auto`：先尝试技能，失败回退本地生成）
+- `XHS_COVER_SKILL_PRIMARY=xiaohongshu-images`
+- `XHS_COVER_SKILL_SECONDARY=image-generation-mcp`
+- `XHS_COVER_SKILL_REQUIRED=true|false`（为 `true` 时技能失败直接报错，不走回退）
+- `XHS_COVER_SKILL_FALLBACK_LOCAL=true|false`
+- `XHS_COVER_SKILL_TIMEOUT_SEC=1200`
+- `XHS_JOB_LOCK_FILE=${PROJECT_DIR}/.state/xhs_ai_blogger_job.lock`
+- `XHS_EXECUTOR_ENABLED=true|false`
+- `XHS_EXECUTOR_MODE=queue_only|command_hooks`
+- `XHS_EXECUTOR_REQUIRE_APPROVAL=true|false`
+- `XHS_EXECUTOR_AUTO_APPROVE=true|false`
+- `XHS_EXECUTOR_SCRIPT=${PROJECT_DIR}/scripts/xhs_auto_executor.py`
+- `XHS_PUBLISH_DRIVER=auto|post_to_xhs|command_hooks`（推荐 `auto`）
+- `XHS_POST_TO_XHS_SCRIPT=${HOME}/.codex/skills/post-to-xhs/scripts/publish_pipeline.py`
+- `XHS_POST_TO_XHS_HEADLESS=true|false`
+- `XHS_POST_TO_XHS_AUTO_PUBLISH=true|false`
+- `XHS_POST_TO_XHS_MODE=image-text|long-article`
+- `XHS_POST_TO_XHS_ACCOUNT=`（可选，指定 skill 内账号名）
+- `XHS_AUTH_MODE=web_session` (recommended)
+- `XHS_SESSION_MAX_AGE_HOURS=72`
+- `XHS_SESSION_CHECK_REQUIRED=true|false`
+- `XHS_HOOK_SESSION_CHECK_CMD` (optional session validation hook)
+- `XHS_RELOGIN_HINT` (message shown when session expired)
+- `XHS_HOOK_PUBLISH_CMD` / `XHS_HOOK_COMMENT_CMD` (only for `command_hooks`)
+- `XHS_ACCOUNT_KEYCHAIN_SERVICE` / `XHS_ACCOUNT_KEYCHAIN_ACCOUNT`
+- `XHS_PYTHON_BIN`（可选，指定任务执行 Python；建议指向已安装 `Pillow` 的解释器）
+
+Runtime behavior:
+
+- Phase A: use local Codex + web search to collect trend signals (with URL/timestamp)
+- local scoring: relevance + monetization + freshness + competition
+- Phase B: generate note drafts + comment interaction plan
+- build execution queue (`publish` + `comment`) and write into report JSON
+- 每条 publish action 自动生成 1 张封面图，并写入 `action_queue[].images`
+- 封面生成支持技能链路：`xiaohongshu-images` -> `image-generation-mcp` -> 本地 `xhs_cover_generator.py`（可配置）
+- 发布执行支持 `post-to-xhs`：`XHS_PUBLISH_DRIVER=auto` 时，检测到 skill 即自动走该发布器
+- optional executor runs automatically after report generation (approval gate on by default)
+- 发布流程开启找不到即停策略（No Retry Policy）：元素缺失时当前动作立即失败并上报，不做同动作重试
+- when web session expires, task sends Feishu alert and pauses execution
+- output sections: `Today Objective` / `Selected Topics` / `Publishing Plan` / `Engagement Plan` / `Risk/Compliance Checks` / `KPI Snapshot` / `Reflection + Tomorrow Optimization`
+
+Start scheduled task:
+
+```bash
+cd "$PROJECT_DIR"
+./scripts/launchd_xhs_ai_blogger.sh start
+```
+
+Check / stop:
+
+```bash
+./scripts/launchd_xhs_ai_blogger.sh status
+./scripts/launchd_xhs_ai_blogger.sh stop
+```
+
+Dry run (generate only, no Feishu send):
+
+```bash
+./scripts/launchd_xhs_ai_blogger.sh dry-run
+```
+
+Run once immediately:
+
+```bash
+./scripts/launchd_xhs_ai_blogger.sh run-now
+```
+
+Task outputs:
+
+- markdown report: `reports/xhs-ai-blogger/YYYY-MM-DD.md`
+- research JSON: `reports/xhs-ai-blogger/YYYY-MM-DD.json`
+- executor result: `reports/xhs-ai-blogger/YYYY-MM-DD.execution.json` (when executor enabled)
+- cover assets: `reports/xhs-ai-blogger/assets/YYYY-MM-DD/cover-1.png`
+
+Configure XHS account in Keychain:
+
+```bash
+cd "$PROJECT_DIR"
+./scripts/xhs_web_session_auth.sh login --account-id <xhs_account_id> --username <login_name> --url https://creator.xiaohongshu.com/new/home
+./scripts/xhs_account_keychain.sh status
+```
+
+> `xhs_web_session_auth.sh` 会打开网页让你手动登录小红书，关闭浏览器后自动保存 `storage_state` 并写入 Keychain。
+
+Executor manual run:
+
+```bash
+cd "$PROJECT_DIR"
+python3 scripts/xhs_auto_executor.py --plan-json reports/xhs-ai-blogger/$(date +%F).json --approve
+```
+
+Generate one local cover manually:
+
+```bash
+cd "$PROJECT_DIR"
+python3 scripts/xhs_cover_generator.py --title "你的标题" --date "$(date +%F)" --keyword "AI提效" --output reports/xhs-ai-blogger/assets/$(date +%F)/cover-1.png
+```
+
+`command_hooks` mode example:
+
+```bash
+XHS_EXECUTOR_MODE=command_hooks
+XHS_HOOK_PUBLISH_CMD='python3 scripts/xhs_web_operator.py publish --storage-state {storage_state} --entry-url https://creator.xiaohongshu.com/new/home --publish-mode image_note --image-strategy text_card --title {title} --content {content} --images {images_csv} --topics {tags_csv} --headful --keep-open-on-fail --hold-seconds-on-fail 1800'
+XHS_HOOK_COMMENT_CMD='python3 scripts/xhs_web_operator.py comment --storage-state {storage_state} --browse-url https://www.xiaohongshu.com/explore --topic {topic} --comment {comment} --headful'
+# 常用占位符：{storage_state} {title} {content} {topic} {comment} {images_csv} {tags_csv}
+# publish 可选：--publish-mode image_note|long_article，--image-strategy text_card|upload
+```
+
+> 默认建议先用 `queue_only + require_approval=true` 跑通流程，再切换到 `command_hooks` 真执行。
 
 ## 4) Feishu Console
 
