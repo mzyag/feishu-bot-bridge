@@ -20,7 +20,17 @@
     <key>PYTHONUNBUFFERED</key>
     <string>1</string>
     <key>PATH</key>
-    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <string>/Users/cn/.npm-global/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key>
+    <string>/Users/cn</string>
+    <key>CLAUDE_CODE_OAUTH_TOKEN</key>
+    <string>YOUR_CLAUDE_CODE_OAUTH_TOKEN_HERE</string>
+    <key>http_proxy</key>
+    <string>http://127.0.0.1:1089</string>
+    <key>https_proxy</key>
+    <string>http://127.0.0.1:1089</string>
+    <key>all_proxy</key>
+    <string>socks5://127.0.0.1:1084</string>
   </dict>
 
   <key>RunAtLoad</key>

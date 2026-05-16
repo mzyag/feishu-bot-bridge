@@ -27,6 +27,33 @@ cd "$PROJECT_DIR"
 python3 -m pip install -r requirements.txt
 ```
 
+## 1.1) Claude Code Backend (Phone → Feishu → Local Claude CLI)
+
+The bot now supports Claude Code CLI as a parallel backend alongside Codex.
+
+Default backend: `claude`. Switch per-message via prefix:
+- `/cc <msg>` — force Claude Code
+- `/codex <msg>` — force Codex
+- no prefix — use `BACKEND` env default
+
+Configure in `.env`:
+
+- `BACKEND=claude` (or `codex`; global default)
+- `USE_CLAUDE_CLI=true`
+- `CLAUDE_CLI_CMD=claude` (or full path e.g. `/Users/cn/.npm-global/bin/claude`)
+- `CLAUDE_WORKDIR=${WORKSPACE_ROOT}` (cwd for claude subprocess; defaults to CODEX_WORKDIR)
+- `CLAUDE_TIMEOUT_SEC=120`
+- `CLAUDE_MODEL=` (optional; e.g. `sonnet` for cost savings, empty = user's default)
+- `CLAUDE_PERMISSION_MODE=bypassPermissions` (required for unattended phone use; also accepts `acceptEdits`, `default`, etc.)
+- `CLAUDE_RESUME_ENABLED=true` (reuse per-user session for context continuity)
+- `CLAUDE_RETRY_FRESH_ON_TIMEOUT=true`
+- `CLAUDE_SESSION_STATE_FILE=.state/claude_sessions.json`
+- `CLAUDE_ADD_DIRS=` (optional comma-separated extra accessible dirs)
+
+> **Cost note:** Default Claude model may be Opus which is expensive for casual use. Set `CLAUDE_MODEL=sonnet` for everyday phone-control tasks.
+
+> **Security note:** `bypassPermissions` allows the CLI to run any command without approval. Only use on a machine you control, behind Feishu user whitelist.
+
 ## 2) Configure
 
 Edit `.env`:
@@ -53,6 +80,10 @@ Edit `.env`:
 
 Tip:
 - send `/reset` (or `重置会话` / `清空记忆`) in Feishu to clear both thread + local memory for your account.
+- send `/status` (or `状态` / `进度` / `任务进度`) in Feishu to check the current task stage without interrupting the running task.
+- send `过程日志` (or `trace` / `思考日志` / `进展日志`) in Feishu to inspect observable task progress: stage changes, visible Codex events, tool summaries, and completion state. Hidden model chain-of-thought is not exposed.
+- send `桌面 Codex 进度` (or `桌面 Codex 状态`) in Feishu to inspect the latest non-bot Codex desktop session from `~/.codex/sessions` without starting a new Codex CLI task.
+- send `/logs` (or `最新日志` / `查看日志` / `错误日志`) in Feishu to get sanitized recent bot logs without invoking Codex. Use `桌面日志` / `Codex 日志` to read a compact latest Codex desktop task transcript, for example `桌面日志 10条`; use `扩展日志` to read the lower-level VS Code extension log.
 
 ## 3) Run
 
@@ -214,7 +245,54 @@ Task outputs:
 - markdown report: `reports/opportunity-scout/YYYY-MM-DD.md`
 - research JSON: `reports/opportunity-scout/YYYY-MM-DD.json`
 
-## 3.3 Xiaohongshu AI Blogger Daily Ops (Feishu + Local Codex)
+## 3.3 BOSS Mac App Semi-Auto Screening
+
+Use `boss-operator` recipe-first workflow in a semi-auto Mac App mode:
+
+- only search/screen jobs (no auto apply / no auto message)
+- manual checkpoints for login/captcha/risk-control popups
+- fail-fast on not-found steps (record then move to next keyword, no retry)
+
+Configure in `.env`:
+
+- `BOSS_OUTPUT_DIR=${PROJECT_DIR}/reports/boss-screening`
+- `BOSS_OPERATOR_RECIPE_PATH=${WORKSPACE_ROOT}/.codex/skills/boss-operator/assets/recipes/boss-web-job-hunt.json`
+- `BOSS_RESUME_PATH` (used to auto-extract suggested keywords)
+- `BOSS_CITIES=上海,杭州`
+- `BOSS_KEYWORDS` (optional override, comma-separated)
+- `BOSS_SALARY_RANGE=25-50K`
+- `BOSS_EXPERIENCE_RANGE=3-10年`
+- `BOSS_MAX_PAGES_PER_QUERY=3`
+- `BOSS_TOP_K=30`
+
+Dry run (generate plan/output skeleton only):
+
+```bash
+cd "$PROJECT_DIR"
+python3 scripts/boss_semiauto_screening.py --dry-run
+```
+
+Run semi-auto collection (interactive checkpoints):
+
+```bash
+cd "$PROJECT_DIR"
+python3 scripts/boss_semiauto_screening.py
+```
+
+Run with pre-collected raw input:
+
+```bash
+cd "$PROJECT_DIR"
+python3 scripts/boss_semiauto_screening.py --raw-input /path/to/jobs.json
+```
+
+Task outputs:
+
+- plan: `reports/boss-screening/YYYY-MM-DD/boss_plan.md`
+- raw data: `reports/boss-screening/YYYY-MM-DD/boss_jobs_raw.json`
+- ranked list: `reports/boss-screening/YYYY-MM-DD/boss_jobs_ranked.md`
+
+## 3.4 Xiaohongshu AI Blogger Daily Ops (Feishu + Local Codex)
 
 Configure in `.env`:
 
