@@ -7,7 +7,6 @@ import shutil
 import subprocess
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set, Tuple
@@ -20,7 +19,7 @@ load_dotenv()
 
 
 def _ensure_feishu_no_proxy() -> None:
-    hosts = {"open.feishu.cn", "msg-frontier.feishu.cn", ".feishu.cn"}
+    hosts = {"open.feishu.cn", "msg-frontier.feishu.cn", ".feishu.cn", "ilinkai.weixin.qq.com", ".weixin.qq.com"}
     existing_raw = os.getenv("NO_PROXY") or os.getenv("no_proxy") or ""
     existing = {item.strip() for item in existing_raw.split(",") if item.strip()}
     merged = sorted(existing.union(hosts))
@@ -274,7 +273,7 @@ _ACTIVE_TASKS_BY_USER: Dict[str, TaskStatus] = {}
 _LAST_TASKS_BY_USER: Dict[str, TaskStatus] = {}
 _TASK_CANCEL_EVENTS_BY_USER: Dict[str, Tuple[int, threading.Event]] = {}
 
-_WORKER_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="feishu-msg-worker")
+from message_queue import message_queue, MessageTask
 
 
 def _resolve_state_file_path() -> Path:
@@ -1109,39 +1108,42 @@ def _trace_events_for_user(open_id: str, seq: Optional[int] = None) -> List[Dict
 
 def _format_task_trace(open_id: str, user_text: str) -> str:
     entry_count = _requested_trace_entries(user_text)
-    active, last = _get_task_status(open_id)
-    status = active or last
-    if not status:
+    active_entry, last_entry = message_queue.get_status(open_id)
+    entry = active_entry or last_entry
+    if not entry:
         return "当前没有正在执行的任务，也没有本次进程内的过程日志。"
 
-    events = _trace_events_for_user(open_id, status.seq)
-    elapsed = int(time.time() - status.started_at)
-    state_label = "运行中" if active else ("已完成" if status.ok else "失败/取消")
+    elapsed = int(time.time() - entry.started_at) if entry.started_at else 0
+    state_label = "运行中" if active_entry else ("已完成" if entry.ok else "失败/取消")
     header = [
-        "Codex 任务过程",
+        "任务过程",
         f"状态: {state_label}",
-        f"任务: {status.user_text_preview or '（空）'}",
-        f"阶段: {status.stage}",
+        f"来源: {entry.task.source}",
+        f"任务: {_preview_text(entry.task.text) or '（空）'}",
+        f"阶段: {entry.stage}",
         f"耗时: {elapsed}s",
     ]
-    if status.detail:
-        header.append(f"详情: {_redact_log_text(status.detail)}")
+    if entry.detail:
+        header.append(f"详情: {_redact_log_text(entry.detail)}")
 
-    selected = events[-entry_count:]
-    omitted = max(0, len(events) - len(selected))
+    trace_entries = message_queue.get_trace(open_id, last_n=entry_count)
+    if not trace_entries:
+        return "\n".join(header) + "\n\n（暂无过程事件）"
+
+    omitted = 0
+    all_trace = message_queue.get_trace(open_id, last_n=200)
+    selected = all_trace[-entry_count:]
+    omitted = max(0, len(all_trace) - len(selected))
     if omitted:
         header.append(f"已省略更早 {omitted} 条")
 
     lines = []
-    for event in selected:
-        ts = time.strftime("%H:%M:%S", time.localtime(float(event.get("ts") or time.time())))
-        kind = str(event.get("kind") or "事件")
-        title = str(event.get("title") or "").strip()
-        detail = str(event.get("detail") or "").strip()
+    for ts_val, seq, source, event, detail in selected:
+        ts_str = time.strftime("%H:%M:%S", time.localtime(ts_val))
         if detail:
-            lines.append(f"{ts} {kind} {title}\n  {detail}")
+            lines.append(f"{ts_str} [{source}] {event}\n  {detail}")
         else:
-            lines.append(f"{ts} {kind} {title}")
+            lines.append(f"{ts_str} [{source}] {event}")
 
     body = "\n\n".join(lines) if lines else "（暂无过程事件）"
     reply = "\n".join(header) + "\n\n" + body
@@ -1256,11 +1258,33 @@ def _format_status_message(status: TaskStatus, active: bool) -> str:
 
 
 def _format_user_status(open_id: str) -> str:
-    active, last = _get_task_status(open_id)
-    if active:
-        return _format_status_message(active, active=True)
-    if last:
-        return _format_status_message(last, active=False)
+    active_entry, last_entry = message_queue.get_status(open_id)
+    if active_entry:
+        elapsed = int(time.time() - active_entry.started_at)
+        lines = [
+            "正在执行",
+            f"来源：{active_entry.task.source}",
+            f"任务：{_preview_text(active_entry.task.text)}",
+            f"阶段：{active_entry.stage}",
+            f"耗时：{elapsed}s",
+        ]
+        if active_entry.detail:
+            lines.append(f"详情：{_redact_log_text(active_entry.detail)}")
+        return "\n".join(lines)
+    if last_entry:
+        label = "上次任务已完成" if last_entry.ok else "上次任务失败"
+        elapsed = int(last_entry.last_updated_at - last_entry.started_at) if last_entry.started_at else 0
+        lines = [
+            label,
+            f"来源：{last_entry.task.source}",
+            f"任务：{_preview_text(last_entry.task.text)}",
+            f"阶段：{last_entry.stage}",
+            f"耗时：{elapsed}s",
+        ]
+        if last_entry.detail:
+            lines.append(f"详情：{_redact_log_text(last_entry.detail)}")
+        lines.append(f"完成时间：{time.strftime('%H:%M:%S', time.localtime(last_entry.last_updated_at))}")
+        return "\n".join(lines)
     return "当前没有正在执行的任务，也没有本次进程内的历史任务记录。"
 
 
@@ -1718,6 +1742,11 @@ class ClaudePersistentSession:
             self._session_id = None
             threading.Thread(target=self._stdout_reader, daemon=True).start()
             threading.Thread(target=self._stderr_reader, daemon=True).start()
+            for _ in range(30):
+                if self._session_id:
+                    break
+                time.sleep(0.2)
+            lark.logger.info("persistent claude session ready, session_id=%s", self._session_id)
             return True
         except Exception:
             lark.logger.exception("failed to start persistent claude session")
@@ -1962,6 +1991,82 @@ def _is_reset_command(text: str) -> bool:
     return normalized in {"/reset", "重置会话", "清空记忆"}
 
 
+_SKILL_TRIGGERS = {
+    "commit": "git-essentials",
+    "push": "git-essentials",
+    "pull": "git-essentials",
+    "merge": "git-essentials",
+    "rebase": "git-essentials",
+    "cherry-pick": "git-essentials",
+    "gitee": "data-catalog-gitee-push",
+    "data-catalog": "data-catalog-gitee-push",
+    "安全审计": "security-audit",
+    "安全扫描": "security-audit",
+    "vulnerability": "security-audit",
+    "pr merge": "auto-pr-merger",
+    "auto merge": "auto-pr-merger",
+}
+
+
+def _check_skill_override(user_text: str) -> Optional[str]:
+    """H1: Check if a more specific workspace skill should handle this instead of team mode."""
+    t = user_text.strip().lower()
+    for trigger, skill in _SKILL_TRIGGERS.items():
+        if trigger in t:
+            return skill
+    return None
+
+
+def _auto_route_mode(user_text: str) -> str:
+    """Keyword-first routing with skill override check. LLM fallback for ambiguous."""
+    skill = _check_skill_override(user_text)
+    if skill:
+        return "single"
+    try:
+        from multi_agent import route_message
+        return route_message(user_text, _CLAUDE_SESSION)
+    except Exception:
+        return "single"
+
+
+def _is_wx_user(open_id: str) -> bool:
+    return "@im.wechat" in open_id or "@im.bot" in open_id
+
+
+def _send_to_user(open_id: str, text: str) -> None:
+    if _is_wx_user(open_id):
+        try:
+            from wx_channel import wx_send_text, _CONTEXT_TOKENS
+            ctx = _CONTEXT_TOKENS.get(open_id, "")
+            wx_send_text(open_id, text, ctx)
+        except Exception:
+            pass
+    else:
+        _reply_text(open_id, text)
+
+
+def _generate_reply_team_mode(
+    user_text: str,
+    open_id: str,
+    progress_callback: Optional[Callable[[str, str], None]] = None,
+) -> ReplyResult:
+    """Run multi-agent team workflow with human-in-the-loop checkpoints."""
+    try:
+        from multi_agent import handle_team_message
+
+        def notify(msg: str) -> None:
+            _send_to_user(open_id, msg)
+            if progress_callback:
+                progress_callback(msg[:40], "")
+
+        result = handle_team_message(user_text, open_id, _CLAUDE_SESSION, notify_fn=notify)
+        _append_user_memory(open_id, "user", user_text)
+        _append_user_memory(open_id, "assistant", result[:500])
+        return ReplyResult(True, result, "team_ok")
+    except Exception as ex:
+        return ReplyResult(False, f"团队模式异常: {ex}", "team_error")
+
+
 def _generate_reply(
     user_text: str,
     open_id: str,
@@ -1982,6 +2087,20 @@ def _generate_reply(
         return ReplyResult(True, "已切换后端但消息为空，请直接发送你的问题。", "empty_after_prefix")
 
     if backend == "claude":
+        from multi_agent import get_workflow
+        active_wf = get_workflow(open_id)
+        if active_wf and active_wf.get("phase", "").startswith("awaiting"):
+            return _generate_reply_team_mode(payload_text, open_id, progress_callback)
+
+        if payload_text.startswith("/team "):
+            team_text = payload_text[6:].strip()
+            if team_text:
+                return _generate_reply_team_mode(team_text, open_id, progress_callback)
+
+        mode = _auto_route_mode(payload_text)
+        if mode == "team":
+            return _generate_reply_team_mode(payload_text, open_id, progress_callback)
+
         claude_reply = _generate_reply_via_claude(
             payload_text,
             open_id,
@@ -2210,14 +2329,30 @@ def do_p2_im_message_receive_v1(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
         _reply_text(open_id, _format_recent_logs(user_text))
         return
 
-    _cancel_active_task(open_id)
-    seq = _next_user_seq(open_id)
     lark.logger.info("received message from %s: %s", open_id, user_text[:120])
-    try:
-        _WORKER_POOL.submit(_handle_message_worker, open_id, user_text, seq)
-    except Exception:
-        lark.logger.exception("submit worker failed for user=%s", open_id)
-        _reply_text(open_id, "当前消息队列异常，请稍后重试。")
+
+    last_tool_count = [0]
+
+    def _feishu_progress(stage: str, detail: str = "") -> None:
+        if not hasattr(_CLAUDE_SESSION, "_tool_log_lock"):
+            return
+        new_entries = []
+        with _CLAUDE_SESSION._tool_log_lock:
+            current_count = len(_CLAUDE_SESSION._tool_log)
+            if current_count > last_tool_count[0]:
+                new_entries = _CLAUDE_SESSION._tool_log[last_tool_count[0]:]
+                last_tool_count[0] = current_count
+        if new_entries:
+            _reply_text(open_id, "\n".join(new_entries))
+
+    message_queue.enqueue(MessageTask(
+        source="feishu",
+        user_id=open_id,
+        text=user_text,
+        reply_fn=lambda text: _reply_text(open_id, text),
+        generate_reply_fn=_generate_reply,
+        on_progress=_feishu_progress,
+    ))
 
 
 def do_message_event(data: lark.CustomizedEvent) -> None:
@@ -2252,6 +2387,14 @@ def main() -> None:
         f"status_updates={SETTINGS.codex_status_update_enabled}, poll={SETTINGS.codex_status_poll_sec}s, "
         f"followup={SETTINGS.codex_status_followup_sec}s)"
     )
+    try:
+        from wx_channel import start_wx_channel
+        wx_thread = start_wx_channel(_generate_reply)
+        if wx_thread:
+            print("[feishu-ws] WeChat channel started")
+    except Exception as ex:
+        print(f"[feishu-ws] WeChat channel not started: {ex}")
+
     cli = lark.ws.Client(
         SETTINGS.app_id,
         SETTINGS.app_secret,
