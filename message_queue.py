@@ -128,6 +128,21 @@ class MessageQueue:
         if task.ack_text:
             task.reply_fn(task.ack_text)
 
+        # Heartbeat: send periodic "still processing" updates
+        heartbeat_stop = threading.Event()
+
+        def _heartbeat():
+            count = 0
+            while not heartbeat_stop.wait(30):
+                if entry.done:
+                    return
+                count += 1
+                elapsed_s = count * 30
+                task.reply_fn(f"⏳ 仍在处理中...（{elapsed_s}s）")
+
+        heartbeat_thread = threading.Thread(target=_heartbeat, name=f"heartbeat-{task.seq}", daemon=True)
+        heartbeat_thread.start()
+
         def _progress(stage: str, detail: str = "") -> None:
             with self._lock:
                 e = self._active_tasks.get(task.user_id)
@@ -150,6 +165,7 @@ class MessageQueue:
             reply_result = _ErrorResult()
 
         elapsed = time.time() - started
+        heartbeat_stop.set()
 
         with self._lock:
             self._cancel_events.pop(task.user_id, None)

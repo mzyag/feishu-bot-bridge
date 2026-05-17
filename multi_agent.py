@@ -35,12 +35,13 @@ _TEAM_KEYWORDS = {
     "写代码", "改代码", "新功能", "重构", "修bug", "修复bug", "修 bug",
     "开发", "实现", "编写", "新增功能", "添加功能", "加一个", "加个",
     "架构设计", "技术方案", "建一个", "创建项目", "写个脚本",
+    "优化一下", "改一下", "修一下", "拆分", "拆一下",
     "fix", "implement", "refactor", "build", "develop",
 }
 _SINGLE_KEYWORDS = {
     "查看", "看看", "看下", "状态", "git status", "git log",
     "什么模型", "哪个模型", "你是谁", "解释", "是什么",
-    "帮我查", "搜索", "搜一下",
+    "帮我查", "搜索", "搜一下", "提交", "同步",
 }
 
 ROUTER_SYSTEM_PROMPT = """你是一个任务路由器。根据用户消息判断应该走哪种处理模式。
@@ -164,7 +165,7 @@ def call_deepseek(system_prompt: str, user_prompt: str, timeout: int = DEEPSEEK_
 # Claude calls (via persistent session or direct)
 # ---------------------------------------------------------------------------
 
-def call_claude_via_session(prompt: str, session, retries: int = 1, timeout_sec: int = 120) -> Tuple[bool, str]:
+def call_claude_via_session(prompt: str, session, retries: int = 1, timeout_sec: int = 180) -> Tuple[bool, str]:
     """Use the existing ClaudePersistentSession for Claude calls. Retries on failure."""
     for attempt in range(retries + 1):
         result = session.send_message(text=prompt, timeout_sec=timeout_sec)
@@ -265,29 +266,27 @@ def is_skip_checkpoint(text: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def route_message(user_text: str, claude_session) -> str:
-    """Keyword-first routing. LLM fallback only for ambiguous messages."""
+    """Keyword-first routing. LLM judges all non-obvious messages."""
     t = user_text.strip().lower()
+    # Fast path: obvious team keywords
     if any(kw in t for kw in _TEAM_KEYWORDS):
         return "team"
+    # Fast path: obvious single keywords
     if any(kw in t for kw in _SINGLE_KEYWORDS):
         return "single"
-    if len(t) < 15:
-        return "single"
+    # All other messages: let LLM decide
     ok, resp = call_claude_via_session(
         f"[ROUTER MODE - 只回复 JSON]\n\n用户消息: {user_text}\n\n{ROUTER_SYSTEM_PROMPT}",
         claude_session,
+        timeout_sec=30,
     )
     if not ok:
         return "single"
-    try:
-        cleaned = resp.strip()
-        if cleaned.startswith("```"):
-            cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-        data = json.loads(cleaned)
+    data = _extract_json_from_response(resp)
+    if data:
         mode = data.get("mode", "single")
         return mode if mode in ("team", "single") else "single"
-    except (json.JSONDecodeError, KeyError):
-        return "single"
+    return "single"
 
 
 def handle_team_message(

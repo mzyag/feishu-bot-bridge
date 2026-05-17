@@ -201,54 +201,15 @@ def clear_thread_id(open_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Memory accessors
+# Memory accessors (delegated to memory.py - kept here for backward compat)
 # ---------------------------------------------------------------------------
 
-
-def get_user_memory(open_id: str) -> List[Dict[str, str]]:
-    if not SETTINGS.memory_enabled:
-        return []
-    with _MEMORY_STATE_LOCK:
-        turns = _MEMORY_BY_USER.get(open_id, [])
-        return [dict(x) for x in turns]
-
-
-def append_user_memory(open_id: str, role: str, text: str) -> None:
-    if not SETTINGS.memory_enabled:
-        return
-    normalized_text = (text or "").strip()
-    if role not in ("user", "assistant") or not normalized_text:
-        return
-    with _MEMORY_STATE_LOCK:
-        turns = _MEMORY_BY_USER.setdefault(open_id, [])
-        turns.append({"role": role, "text": normalized_text})
-        max_items = SETTINGS.codex_memory_turns * 2
-        if len(turns) > max_items:
-            del turns[:-max_items]
-    _memory_saver.trigger()
-
-
-def clear_user_memory(open_id: str) -> None:
-    with _MEMORY_STATE_LOCK:
-        existed = open_id in _MEMORY_BY_USER
-        if existed:
-            _MEMORY_BY_USER.pop(open_id, None)
-    if existed:
-        _memory_saver.trigger()
-
-
-def format_memory_context(turns: List[Dict[str, str]]) -> str:
-    if not turns:
-        return ""
-    lines = ["最近对话摘要（按时间顺序）:"]
-    for turn in turns:
-        role_label = "用户" if turn.get("role") == "user" else "助手"
-        text = str(turn.get("text", "")).strip()
-        if text:
-            lines.append(f"- {role_label}: {text}")
-    if len(lines) == 1:
-        return ""
-    return "\n".join(lines)
+from memory import (  # noqa: E402
+    get_user_memory,
+    append_user_memory,
+    clear_user_memory,
+    format_memory_context,
+)
 
 
 # ---------------------------------------------------------------------------

@@ -12,13 +12,11 @@ import lark_oapi as lark
 from config import SETTINGS, ReplyResult
 from feishu_api import LARK_CLIENT, reply_text, update_text_message
 from state import (
-    append_user_memory,
     clear_claude_session_id,
     clear_thread_id,
-    clear_user_memory,
-    get_user_memory,
     is_duplicate_recent,
 )
+from memory import append_user_memory, clear_user_memory, get_user_memory
 from text_utils import (
     extract_text,
     is_desktop_codex_status_command,
@@ -294,7 +292,74 @@ def do_p2_im_message_receive_v1(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
         reply_text(open_id, format_recent_logs(user_text))
         return
 
+    if user_text.strip() == "/retry":
+        from claude_session import ClaudePersistentSession
+        partial = ClaudePersistentSession.load_partial()
+        if partial:
+            resume_text = f"继续之前中断的任务:\n原始请求: {partial.get('text', '')}\n上次进度: {partial.get('tool_log', [])[-2:]}"
+            message_queue.enqueue(MessageTask(
+                source="feishu",
+                user_id=open_id,
+                text=resume_text,
+                reply_fn=lambda text: reply_text(open_id, text),
+                generate_reply_fn=_generate_reply,
+            ))
+        else:
+            reply_text(open_id, "没有可恢复的中断任务。")
+        return
+
+    if user_text.strip().startswith("/review"):
+        from memory import get_unreviewed_episodes
+        eps = get_unreviewed_episodes(open_id)
+        if eps:
+            lines = [f"[{e.get('id','')}] {e.get('outcome','')} — {e.get('user_goal','')[:50]}" for e in eps]
+            reply_text(open_id, "待审阅的学习记录:\n" + "\n".join(lines))
+        else:
+            reply_text(open_id, "没有待审阅的学习记录。")
+        return
+
+    if user_text.strip().startswith("/promote "):
+        from memory import promote_episode
+        ep_id = user_text.strip()[9:].strip()
+        ok = promote_episode(open_id, ep_id)
+        reply_text(open_id, f"✅ 已提升: {ep_id}" if ok else f"❌ 未找到: {ep_id}")
+        return
+
+    if user_text.strip().startswith("/reject "):
+        from memory import reject_episode
+        ep_id = user_text.strip()[8:].strip()
+        ok = reject_episode(open_id, ep_id)
+        reply_text(open_id, f"✅ 已拒绝: {ep_id}" if ok else f"❌ 未找到: {ep_id}")
+        return
+
     lark.logger.info("received message from %s: %s", open_id, user_text[:120])
+
+    import time as _time
+
+    class _FeishuDraftReply:
+        def __init__(self, oid):
+            self._open_id = oid
+            self._message_id = None
+            self._last_edit_ts = 0.0
+            self._accumulated = ""
+
+        def __call__(self, text):
+            now = _time.time()
+            if self._message_id is None:
+                self._message_id = reply_text(self._open_id, text)
+                self._accumulated = text
+                self._last_edit_ts = now
+            else:
+                self._accumulated = text
+                if now - self._last_edit_ts >= 0.5:
+                    ok, _ = update_text_message(self._message_id, text)
+                    if ok:
+                        self._last_edit_ts = now
+                    else:
+                        self._message_id = reply_text(self._open_id, text)
+                        self._last_edit_ts = now
+
+    draft_reply = _FeishuDraftReply(open_id)
 
     last_tool_count = [0]
 
@@ -308,13 +373,14 @@ def do_p2_im_message_receive_v1(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                 new_entries = CLAUDE_SESSION._tool_log[last_tool_count[0]:]
                 last_tool_count[0] = current_count
         if new_entries:
-            reply_text(open_id, "\n".join(new_entries))
+            progress_text = "\n".join(new_entries)
+            draft_reply(progress_text)
 
     message_queue.enqueue(MessageTask(
         source="feishu",
         user_id=open_id,
         text=user_text,
-        reply_fn=lambda text: reply_text(open_id, text),
+        reply_fn=draft_reply,
         generate_reply_fn=_generate_reply,
         on_progress=_feishu_progress,
     ))
@@ -366,6 +432,15 @@ def main() -> None:
             print("[feishu-ws] WeChat channel started")
     except Exception as ex:
         print(f"[feishu-ws] WeChat channel not started: {ex}")
+
+    try:
+        from health_monitor import start_health_monitor
+        alert_user = list(SETTINGS.allowed_user_ids)[0] if SETTINGS.allowed_user_ids else None
+        if alert_user:
+            start_health_monitor(CLAUDE_SESSION, message_queue, lambda text: reply_text(alert_user, text))
+            print("[feishu-ws] Health monitor started")
+    except Exception as ex:
+        print(f"[feishu-ws] Health monitor not started: {ex}")
 
     cli = lark.ws.Client(
         SETTINGS.app_id,

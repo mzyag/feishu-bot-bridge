@@ -15,13 +15,11 @@ import lark_oapi as lark
 
 from config import SETTINGS, ReplyResult
 from state import (
-    append_user_memory,
     clear_thread_id,
-    format_memory_context,
     get_thread_id,
-    get_user_memory,
     set_thread_id,
 )
+from memory import append_user_memory, format_memory_context, get_user_memory
 
 
 def _parse_codex_json_events(raw: str) -> Tuple[Optional[str], str]:
@@ -251,7 +249,7 @@ def generate_reply_via_codex(
     existing_thread_id = get_thread_id(open_id) if SETTINGS.codex_resume_enabled else None
     memory_context = ""
     if not existing_thread_id and SETTINGS.memory_enabled:
-        memory_context = format_memory_context(get_user_memory(open_id))
+        memory_context = format_memory_context(get_user_memory(open_id), open_id=open_id)
 
     prompt = (
         "你是飞书里的中文助手。请用简洁中文直接回答用户问题，"

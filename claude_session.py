@@ -5,6 +5,7 @@ Dependencies: config, state
 
 import json
 import os
+import pty
 import queue
 import shutil
 import subprocess
@@ -16,7 +17,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import lark_oapi as lark
 
 from config import SETTINGS, ReplyResult
-from state import append_user_memory
+from memory import append_user_memory, log_episode
 
 
 def claude_event_progress(obj: dict) -> Tuple[Optional[str], str]:
@@ -77,6 +78,7 @@ class ClaudePersistentSession:
         self._tool_log_lock = threading.Lock()
         self._last_stdout_ts: float = 0.0
         self._restart_backoff: float = 1.0
+        self._input_tokens_used: int = 0
 
     def _resolve_claude_bin(self) -> Optional[str]:
         claude_bin = shutil.which(SETTINGS.claude_cmd)
@@ -107,6 +109,7 @@ class ClaudePersistentSession:
             "--input-format", "stream-json",
             "--output-format", "stream-json",
             "--permission-mode", SETTINGS.claude_permission_mode,
+            "--max-turns", "25",
             "--append-system-prompt", system_prompt,
         ]
         if self._session_id and SETTINGS.claude_resume_enabled:
@@ -127,22 +130,30 @@ class ClaudePersistentSession:
         try:
             proc_env = os.environ.copy()
             proc_env.setdefault("HOME", str(Path.home()))
+            proc_env.setdefault("BASH_DEFAULT_TIMEOUT_MS", "300000")
+            proc_env.setdefault("BASH_MAX_TIMEOUT_MS", "600000")
+            proc_env.setdefault("MCP_TIMEOUT", "60000")
+            proc_env.setdefault("MCP_TOOL_TIMEOUT", "300000")
+            master_fd, slave_fd = pty.openpty()
             self._proc = subprocess.Popen(
                 cmd,
                 stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
+                stdout=slave_fd,
                 stderr=subprocess.PIPE,
                 text=True,
                 bufsize=1,
                 cwd=SETTINGS.claude_workdir or None,
                 env=proc_env,
             )
+            os.close(slave_fd)
+            self._stdout_fd = master_fd
+            self._stdout_file = os.fdopen(master_fd, "r", encoding="utf-8", errors="replace")
             self._alive = True
             self._session_id = None
             self._last_stdout_ts = time.time()
             threading.Thread(target=self._stdout_reader, daemon=True).start()
             threading.Thread(target=self._stderr_reader, daemon=True).start()
-            for _ in range(50):
+            for _ in range(75):
                 if self._session_id:
                     break
                 time.sleep(0.2)
@@ -205,11 +216,14 @@ class ClaudePersistentSession:
                             self._tool_log.append(entry)
 
     def _stdout_reader(self) -> None:
-        proc = self._proc
-        if not proc or not proc.stdout:
-            return
+        stdout = getattr(self, "_stdout_file", None)
+        if not stdout:
+            proc = self._proc
+            if not proc or not proc.stdout:
+                return
+            stdout = proc.stdout
         try:
-            for line in proc.stdout:
+            for line in stdout:
                 self._last_stdout_ts = time.time()
                 stripped = line.strip()
                 if not stripped.startswith("{"):
@@ -231,6 +245,10 @@ class ClaudePersistentSession:
                         except Exception:
                             pass
                 if obj.get("type") == "result":
+                    usage = obj.get("usage") or {}
+                    input_t = usage.get("input_tokens") or 0
+                    if input_t:
+                        self._input_tokens_used = input_t
                     if obj.get("is_error"):
                         lark.logger.error(
                             "claude persistent result error: api_status=%s subtype=%s result=%s",
@@ -255,7 +273,51 @@ class ClaudePersistentSession:
         except Exception:
             pass
 
-    _STALL_TIMEOUT = 300
+    _STALL_TIMEOUT = 660
+    _TOKEN_LIMITS = {"opus": 1_000_000, "sonnet": 200_000}
+    _COMPACTION_THRESHOLD = 0.8
+
+    def _needs_compaction(self) -> bool:
+        model = (SETTINGS.claude_model or "sonnet").lower()
+        limit = next((v for k, v in self._TOKEN_LIMITS.items() if k in model), 200_000)
+        return self._input_tokens_used > limit * self._COMPACTION_THRESHOLD
+
+    def _save_partial(self, text: str) -> str:
+        partial_dir = Path(__file__).parent / ".state" / "partial"
+        partial_dir.mkdir(parents=True, exist_ok=True)
+        partial_id = f"{int(time.time())}"
+        with self._tool_log_lock:
+            context = {"text": text[:500], "tool_log": list(self._tool_log[-5:]), "ts": time.time()}
+        (partial_dir / f"{partial_id}.json").write_text(
+            json.dumps(context, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        lark.logger.info("saved partial context: %s", partial_id)
+        return partial_id
+
+    @staticmethod
+    def load_partial(partial_id: str = "") -> Optional[dict]:
+        partial_dir = Path(__file__).parent / ".state" / "partial"
+        if partial_id:
+            path = partial_dir / f"{partial_id}.json"
+        else:
+            files = sorted(partial_dir.glob("*.json")) if partial_dir.exists() else []
+            if not files:
+                return None
+            path = files[-1]
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+        return None
+
+    def _compact_context(self) -> None:
+        lark.logger.info("triggering context compaction (tokens=%d)", self._input_tokens_used)
+        compact_msg = {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "请用300字总结我们到目前为止的对话要点和关键决策，以便节省上下文空间继续工作。"}]}}
+        try:
+            self._proc.stdin.write(json.dumps(compact_msg, ensure_ascii=False) + "\n")
+            self._proc.stdin.flush()
+            self._result_queue.get(timeout=60)
+            self._input_tokens_used = 0
+        except Exception:
+            pass
 
     def is_alive(self) -> bool:
         if not self._alive or self._proc is None or self._proc.poll() is not None:
@@ -341,11 +403,13 @@ class ClaudePersistentSession:
                 if cancel_event and cancel_event.is_set():
                     return {"status": "cancelled"}
                 if not self.is_alive():
-                    return {"status": "error", "error": "claude 进程退出（可能被 watchdog 终止）"}
+                    partial_id = self._save_partial(text)
+                    return {"status": "error", "error": "claude 进程退出（可能被 watchdog 终止）", "partial_id": partial_id}
                 elapsed = time.time() - started_at
                 if elapsed > timeout_value:
+                    partial_id = self._save_partial(text)
                     self._kill_and_reset("timeout in send_message loop")
-                    return {"status": "timeout"}
+                    return {"status": "timeout", "partial_id": partial_id}
                 try:
                     result = self._result_queue.get(timeout=1.0)
                     content = str(result.get("result", "")).strip()
@@ -358,6 +422,8 @@ class ClaudePersistentSession:
                         err_msg = content or f"Claude API error (status={api_status})"
                         return {"status": "error", "error": err_msg, "tool_log": tool_log}
                     if content:
+                        if self._needs_compaction():
+                            threading.Thread(target=self._compact_context, daemon=True).start()
                         return {"status": "ok", "content": content, "session_id": self._session_id, "tool_log": tool_log}
                     return {"status": "empty", "session_id": self._session_id, "tool_log": tool_log}
                 except queue.Empty:
@@ -379,6 +445,13 @@ class ClaudePersistentSession:
                     self._proc.kill()
                 except Exception:
                     pass
+        stdout_file = getattr(self, "_stdout_file", None)
+        if stdout_file:
+            try:
+                stdout_file.close()
+            except Exception:
+                pass
+            self._stdout_file = None
         self._alive = False
         self._proc = None
 
@@ -413,10 +486,13 @@ def generate_reply_via_claude(
         content = result["content"]
         append_user_memory(open_id, "user", user_text)
         append_user_memory(open_id, "assistant", content)
+        log_episode(open_id, "single", user_text[:100], "success", content[:100])
         return ReplyResult(True, content, "ok")
     if result["status"] == "cancelled":
+        log_episode(open_id, "single", user_text[:100], "cancelled")
         return ReplyResult(False, "该请求已被你更新的最新消息取消。", "cancelled")
     if result["status"] == "timeout":
+        log_episode(open_id, "single", user_text[:100], "timeout")
         return ReplyResult(False, f"Claude 超时（>{SETTINGS.claude_timeout_sec}s），请稍后重试。", "timeout")
     if result["status"] == "empty":
         return ReplyResult(False, "Claude 已执行，但未返回文本。", "empty")
