@@ -67,7 +67,7 @@ def _build_headers() -> Dict[str, str]:
 
 
 def _base_info() -> dict:
-    return {"channel_version": WX_CONFIG.channel_version, "bot_agent": "FeishuBotBridge/1.0"}
+    return {"channel_version": WX_CONFIG.channel_version, "bot_agent": "OpenClaw"}
 
 
 _TYPING_TICKETS: Dict[str, str] = {}
@@ -116,13 +116,17 @@ class WxTypingKeepalive:
     def __init__(self, user_id: str, context_token: str = ""):
         self._user_id = user_id
         self._stop = threading.Event()
-        wx_get_config(user_id, context_token)
+        print(f"[typing] init for {user_id[:20]}")
+        ticket = wx_get_config(user_id, context_token)
+        print(f"[typing] ticket: {'OK' if ticket else 'NONE'}")
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
+        print(f"[typing] thread started")
 
     def _loop(self):
         while not self._stop.wait(5):
-            wx_send_typing(self._user_id, 1)
+            ok = wx_send_typing(self._user_id, 1)
+            print(f"[typing] keepalive to {self._user_id[:20]}: {'OK' if ok else 'FAIL'}")
 
     def stop(self):
         self._stop.set()
@@ -137,6 +141,7 @@ def wx_notify_start() -> bool:
             json={"base_info": _base_info()},
             timeout=10,
         )
+        print(f"[wx] notifyStart: status={resp.status_code} body={resp.text[:200]}")
         return resp.status_code == 200
     except Exception as ex:
         print(f"[wx] notifyStart failed: {ex}")
@@ -165,7 +170,11 @@ def wx_get_updates(get_updates_buf: str = "") -> dict:
             timeout=timeout_sec,
         )
         if resp.status_code == 200:
-            return resp.json()
+            data = resp.json()
+            ret = data.get("ret", 0)
+            if ret != 0:
+                print(f"[wx] getUpdates api_error: ret={ret} errcode={data.get('errcode')} errmsg={data.get('errmsg','')[:100]}")
+            return data
     except httpx.ReadTimeout:
         return {"ret": 0, "msgs": [], "get_updates_buf": get_updates_buf}
     except Exception as ex:
@@ -175,7 +184,8 @@ def wx_get_updates(get_updates_buf: str = "") -> dict:
 
 
 def _wx_send_once(to_user_id: str, text: str, context_token: str = "") -> int:
-    """Send once, return ret code (0=success, negative=error)."""
+    """Send once, return ret code (0=success, negative=error). Uses fresh connection."""
+    print(f"[wx] _send_once: len={len(text)}, ctx={'yes' if context_token else 'no'}")
     msg = {
         "from_user_id": "",
         "to_user_id": to_user_id,
@@ -186,12 +196,12 @@ def _wx_send_once(to_user_id: str, text: str, context_token: str = "") -> int:
     }
     if context_token:
         msg["context_token"] = context_token
-    resp = _get_wx_http().post(
-        f"{WX_CONFIG.base_url}/ilink/bot/sendmessage",
-        headers=_build_headers(),
-        json={"msg": msg, "base_info": _base_info()},
-        timeout=WX_CONFIG.timeout_ms / 1000,
-    )
+    with httpx.Client(timeout=WX_CONFIG.timeout_ms / 1000) as fresh_client:
+        resp = fresh_client.post(
+            f"{WX_CONFIG.base_url}/ilink/bot/sendmessage",
+            headers=_build_headers(),
+            json={"msg": msg, "base_info": _base_info()},
+        )
     if resp.status_code != 200:
         return -999
     try:
@@ -201,35 +211,41 @@ def _wx_send_once(to_user_id: str, text: str, context_token: str = "") -> int:
 
 
 _wx_send_failures = [0]
-_wx_last_send_ts = [0.0]
-_WX_MIN_SEND_INTERVAL = 2.0
+_wx_send_count = [0]
+_wx_send_window_start = [0.0]
+_wx_cooldown_until = [0.0]
+_WX_MAX_SENDS_PER_WINDOW = 4
+_WX_WINDOW_SEC = 60.0
+_WX_COOLDOWN_SEC = 60.0
 
 
-def wx_send_text(to_user_id: str, text: str, context_token: str = "") -> bool:
+def wx_send_text(to_user_id: str, text: str, context_token: str = "", priority: bool = False) -> bool:
     now = time.time()
-    elapsed = now - _wx_last_send_ts[0]
-    if elapsed < _WX_MIN_SEND_INTERVAL:
-        time.sleep(_WX_MIN_SEND_INTERVAL - elapsed)
-    _wx_last_send_ts[0] = time.time()
+    if now < _wx_cooldown_until[0]:
+        if priority:
+            remaining = _wx_cooldown_until[0] - now
+            print(f"[wx] priority msg waiting {remaining:.0f}s cooldown")
+            time.sleep(remaining + 1)
+        else:
+            print(f"[wx] in cooldown, dropping len={len(text)}")
+            return False
+    if now - _wx_send_window_start[0] > _WX_WINDOW_SEC:
+        _wx_send_count[0] = 0
+        _wx_send_window_start[0] = now
+    if not priority and _wx_send_count[0] >= _WX_MAX_SENDS_PER_WINDOW:
+        print(f"[wx] rate limited, dropping len={len(text)}")
+        return False
+    _wx_send_count[0] += 1
     try:
         ret = _wx_send_once(to_user_id, text, context_token)
         if ret == 0:
             _wx_send_failures[0] = 0
             return True
         print(f"[wx] sendMessage ret={ret}, len={len(text)}")
+        if ret == -2:
+            _wx_cooldown_until[0] = time.time() + _WX_COOLDOWN_SEC
+            print(f"[wx] ret=-2, cooldown {_WX_COOLDOWN_SEC}s")
         _wx_send_failures[0] += 1
-        if _wx_send_failures[0] >= 3:
-            print(f"[wx] 3+ failures, full session reset: notifyStop + notifyStart")
-            wx_notify_stop()
-            time.sleep(1)
-            wx_notify_start()
-            _wx_send_failures[0] = 0
-            time.sleep(2)
-            ret2 = _wx_send_once(to_user_id, text, "")
-            if ret2 == 0:
-                print(f"[wx] session reset worked!")
-                return True
-            print(f"[wx] session reset failed: ret={ret2}")
         return False
     except Exception as ex:
         print(f"[wx] sendMessage failed: {ex}")
@@ -298,9 +314,9 @@ def start_wx_channel(generate_reply_fn, reply_text_fn=None) -> Optional[threadin
 
     from message_queue import message_queue, MessageTask
 
-    def _wx_reply(user_id: str, text: str) -> None:
+    def _wx_reply(user_id: str, text: str, priority: bool = False) -> None:
         ctx = _CONTEXT_TOKENS.get(user_id, "")
-        wx_send_text(user_id, text, ctx)
+        wx_send_text(user_id, text, ctx, priority=priority)
 
     def _poll_loop() -> None:
         print(f"[wx] starting WeChat channel (base_url={WX_CONFIG.base_url})")
@@ -333,6 +349,7 @@ def start_wx_channel(generate_reply_fn, reply_text_fn=None) -> Optional[threadin
                     continue
 
                 ctx_token = msg.get("context_token", "")
+                print(f"[wx] context_token: {'present' if ctx_token else 'MISSING'} for {from_user[:20]}")
                 if ctx_token:
                     if len(_CONTEXT_TOKENS) >= _CONTEXT_TOKENS_MAX:
                         oldest = next(iter(_CONTEXT_TOKENS))
@@ -370,7 +387,7 @@ def start_wx_channel(generate_reply_fn, reply_text_fn=None) -> Optional[threadin
 
                 def _wx_reply_with_typing_stop(text, uid=from_user, _typing=typing):
                     _typing.stop()
-                    _wx_reply(uid, text)
+                    _wx_reply(uid, text, priority=True)
 
                 message_queue.enqueue(MessageTask(
                     source="wechat",

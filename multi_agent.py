@@ -42,6 +42,8 @@ _SINGLE_KEYWORDS = {
     "查看", "看看", "看下", "状态", "git status", "git log",
     "什么模型", "哪个模型", "你是谁", "解释", "是什么",
     "帮我查", "搜索", "搜一下", "提交", "同步",
+    "刚才", "刚刚", "上次", "之前", "问的是什么", "进度",
+    "解决了吗", "完成了吗", "怎么样了",
 }
 
 ROUTER_SYSTEM_PROMPT = """你是一个任务路由器。根据用户消息判断应该走哪种处理模式。
@@ -189,7 +191,7 @@ _WORKFLOW_BY_USER: Dict[str, dict] = {}
 _WORKFLOW_STATE_FILE = os.path.join(os.path.dirname(__file__), ".state", "team_workflows.json")
 _WORKFLOW_TIMEOUT_SEC = 1800
 
-_CONFIRM_EXACT = {"确认", "确定", "ok", "可以", "继续", "执行", "approve", "yes", "好", "好的", "同意", "通过", "没问题", "开始", "嗯", "行", "对", "是的", "没错"}
+_CONFIRM_EXACT = {"确认", "确定", "ok", "可以", "继续", "执行", "开始执行", "approve", "yes", "好", "好的", "同意", "通过", "没问题", "开始", "嗯", "行", "对", "是的", "没错", "做吧", "搞吧", "干吧"}
 _REJECT_EXACT = {"取消", "cancel", "不要", "算了", "停", "stop", "重来", "reject", "不执行", "放弃"}
 _SKIP_EXACT = {"全部执行", "一键执行", "跳过确认", "skip", "直接执行", "auto"}
 

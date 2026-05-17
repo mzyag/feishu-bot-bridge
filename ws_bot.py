@@ -136,18 +136,18 @@ def _generate_reply_team_mode(
         from multi_agent import handle_team_message
         import time as _t
 
-        _last_notify = [0.0]
+        _notify_buffer = []
 
         def notify(msg: str) -> None:
-            now = _t.time()
-            if now - _last_notify[0] < 1.0:
-                _t.sleep(1.0)
-            _send_to_user(open_id, msg)
-            _last_notify[0] = _t.time()
+            _notify_buffer.append(msg)
             if progress_callback:
                 progress_callback(msg[:40], "")
 
         result = handle_team_message(user_text, open_id, CLAUDE_SESSION, notify_fn=notify)
+        if _notify_buffer:
+            summary = "\n".join(_notify_buffer[-15:])
+            _send_to_user(open_id, summary)
+            _notify_buffer.clear()
         lark.logger.info("[team_mode] reply len=%d preview=%s", len(result), result[:80])
         append_user_memory(open_id, "user", user_text)
         append_user_memory(open_id, "assistant", result[:500])

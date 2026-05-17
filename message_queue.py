@@ -132,20 +132,9 @@ class MessageQueue:
         heartbeat_stop = threading.Event()
 
         def _heartbeat():
-            print(f"[heartbeat] thread started for {task.user_id[:20]} seq={task.seq}")
-            count = 0
             while not heartbeat_stop.wait(30):
                 if entry.done:
-                    print(f"[heartbeat] exiting: entry.done=True")
                     return
-                count += 1
-                elapsed_s = count * 30
-                msg = f"⏳ 仍在处理中...（{elapsed_s}s）"
-                try:
-                    task.reply_fn(msg)
-                    print(f"[heartbeat] sent #{count} to {task.user_id[:20]}")
-                except Exception as ex:
-                    print(f"[heartbeat] FAILED: {ex}")
             print(f"[heartbeat] exiting: stop event set")
 
         heartbeat_thread = threading.Thread(target=_heartbeat, name=f"heartbeat-{task.seq}", daemon=True)

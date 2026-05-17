@@ -66,19 +66,40 @@ def claude_event_progress(obj: dict) -> Tuple[Optional[str], str]:
     return None, ""
 
 
+_SESSION_ID_FILE = Path(__file__).resolve().parent / ".state" / "claude_session_id.txt"
+
+
 class ClaudePersistentSession:
     def __init__(self) -> None:
         self._proc: Optional[subprocess.Popen] = None
         self._lock = threading.Lock()
         self._result_queue: "queue.Queue[dict]" = queue.Queue()
         self._progress_callback: Optional[Callable[[str, str], None]] = None
-        self._session_id: Optional[str] = None
+        self._session_id: Optional[str] = self._load_session_id()
         self._alive = False
         self._tool_log: List[str] = []
         self._tool_log_lock = threading.Lock()
         self._last_stdout_ts: float = 0.0
         self._restart_backoff: float = 1.0
         self._input_tokens_used: int = 0
+
+    @staticmethod
+    def _load_session_id() -> Optional[str]:
+        try:
+            if _SESSION_ID_FILE.exists():
+                sid = _SESSION_ID_FILE.read_text(encoding="utf-8").strip()
+                if sid:
+                    return sid
+        except Exception:
+            pass
+        return None
+
+    def _save_session_id(self) -> None:
+        try:
+            _SESSION_ID_FILE.parent.mkdir(parents=True, exist_ok=True)
+            _SESSION_ID_FILE.write_text(self._session_id or "", encoding="utf-8")
+        except Exception:
+            pass
 
     def _resolve_claude_bin(self) -> Optional[str]:
         claude_bin = shutil.which(SETTINGS.claude_cmd)
@@ -237,6 +258,7 @@ class ClaudePersistentSession:
                 sid = obj.get("session_id")
                 if isinstance(sid, str) and sid:
                     self._session_id = sid
+                    self._save_session_id()
                 self._extract_tool_log(obj)
                 cb = self._progress_callback
                 if cb:
