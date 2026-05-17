@@ -1,569 +1,245 @@
-# Feishu Bot Bridge (Long Connection SDK)
+# Feishu Bot Bridge
 
-Feishu long-connection bot using `lark-oapi`:
-- persistent connection mode (no callback URL needed)
-- text message handling
-- user whitelist (`ALLOWED_USER_IDS`)
-- reply backend priority: local `codex` CLI -> OpenAI API -> echo fallback
-- duplicate event/message suppression (avoid double replies)
-- per-user Codex thread reuse via `codex exec resume` (reduces cold-start overhead)
-- per-user short-term local memory fallback (context survives thread reset/timeout)
-- long-running requests use a placeholder reply then update the same message in place
-- periodic task status updates (default every 3 seconds) during long runs
-- auto fallback to new status messages when Feishu edit limit is reached
-- auto bypass proxy for `*.feishu.cn` to reduce websocket reconnect failures
+[English](#english) | [中文](#中文)
 
-## 1) Install
+---
 
-Use path-safe variables (avoid hardcoded `/Users/...`):
+## English
 
-```bash
-export WORKSPACE_ROOT="${WORKSPACE_ROOT:-$HOME/Workspace}"
-export PROJECT_DIR="${PROJECT_DIR:-$WORKSPACE_ROOT/feishu-bot-bridge}"
+A multi-channel AI bot bridge that connects **Feishu (Lark)** and **WeChat** to **Claude Code CLI**, enabling phone-based control of your development environment.
+
+### Features
+
+- **Dual channel**: Feishu (WebSocket) + WeChat (long-poll via ilinkai API)
+- **Claude Code persistent session**: bidirectional stream-json, maintains context across messages
+- **Multi-agent team mode**: Dispatcher (Claude) + Executor (Claude Code + DeepSeek) + Reviewer (Claude)
+- **TDD workflow**: auto-generates tests before execution, validates after
+- **Harness compliance**: follows H0-H6 workspace skill harness
+- **Session warmup**: Claude process pre-starts at boot, ready when first message arrives
+- **Watchdog**: kills stalled processes (90s no stdout), auto-restart with backoff
+- **Unified message queue**: platform-agnostic task processing with deduplication
+
+### Architecture
+
+```
+┌──────────┐  ┌──────────┐  ┌──────────┐
+│  Feishu   │  │  WeChat   │  │  Future   │
+└─────┬────┘  └─────┬────┘  └─────┬────┘
+      │              │              │
+      └──────┬───────┘──────────────┘
+             ▼
+    ┌─────────────────┐
+    │  Message Queue   │   unified task processing
+    └────────┬────────┘
+             │
+     ┌───────┴────────┐
+     │   Router        │   keyword → skill / team / single
+     └───────┬────────┘
+             │
+    ┌────────┴─────────┐
+    │ Single: Claude    │   direct reply (file access, tools)
+    │ Team: multi-agent │   Dispatcher → Executor → Reviewer
+    └──────────────────┘
 ```
 
+### Multi-Agent Team Mode
+
+Triggered automatically for development tasks or manually via `/team <request>`.
+
+```
+User sends task
+  → H0: Dispatcher analyzes requirements + risk assessment
+  → User confirms requirement understanding
+  → H2: Dispatcher creates execution plan (with acceptance criteria)
+  → User confirms plan
+  → H3: For each step (TDD):
+       1. Generate test from acceptance criteria
+       2. DeepSeek drafts solution (advisor)
+       3. Claude Code executes (real file access)
+       4. Run pre-generated test
+       5. Validate step output
+  → H4: Final review (Reviewer)
+  → H5: Structured delivery report
+  → H6: Post-task episode capture
+```
+
+### File Structure
+
+```
+ws_bot.py           → Entry point: routing, event handler, main()
+config.py           → Settings, ReplyResult
+feishu_api.py       → Feishu IM API (reply/update)
+state.py            → State management (thread/memory/session)
+text_utils.py       → Text parsing, command detection
+log_viewer.py       → Log/status/trace formatting
+codex_runner.py     → Codex CLI executor
+claude_session.py   → Claude persistent session (stream-json)
+message_queue.py    → Unified message queue
+multi_agent.py      → Team mode orchestration (TDD)
+wx_channel.py       → WeChat channel (ilinkai long-poll)
+```
+
+### Setup
+
 ```bash
-cd "$PROJECT_DIR"
+cd feishu-bot-bridge
 python3 -m pip install -r requirements.txt
+cp .env.example .env
+# Edit .env with your credentials
 ```
 
-## 1.1) Claude Code Backend (Phone → Feishu → Local Claude CLI)
+Required in `.env`:
+- `FEISHU_APP_ID` / `FEISHU_APP_SECRET` — from Feishu console
+- `CLAUDE_CODE_OAUTH_TOKEN` — from `claude setup-token`
+- `ALLOWED_USER_IDS` — Feishu open_id whitelist
 
-The bot now supports Claude Code CLI as a parallel backend alongside Codex.
+Optional:
+- `WX_BOT_ENABLED=true` + `WX_BOT_TOKEN` — enable WeChat channel
+- `DEEPSEEK_API_KEY` — enable DeepSeek advisor in team mode
+- Proxy settings (`http_proxy`, `https_proxy`) — required if behind GFW
 
-Default backend: `claude`. Switch per-message via prefix:
-- `/cc <msg>` — force Claude Code
-- `/codex <msg>` — force Codex
-- no prefix — use `BACKEND` env default
-
-Configure in `.env`:
-
-- `BACKEND=claude` (or `codex`; global default)
-- `USE_CLAUDE_CLI=true`
-- `CLAUDE_CLI_CMD=claude` (or full path e.g. `/Users/cn/.npm-global/bin/claude`)
-- `CLAUDE_WORKDIR=${WORKSPACE_ROOT}` (cwd for claude subprocess; defaults to CODEX_WORKDIR)
-- `CLAUDE_TIMEOUT_SEC=120`
-- `CLAUDE_MODEL=` (optional; e.g. `sonnet` for cost savings, empty = user's default)
-- `CLAUDE_PERMISSION_MODE=bypassPermissions` (required for unattended phone use; also accepts `acceptEdits`, `default`, etc.)
-- `CLAUDE_RESUME_ENABLED=true` (reuse per-user session for context continuity)
-- `CLAUDE_RETRY_FRESH_ON_TIMEOUT=true`
-- `CLAUDE_SESSION_STATE_FILE=.state/claude_sessions.json`
-- `CLAUDE_ADD_DIRS=` (optional comma-separated extra accessible dirs)
-
-> **Cost note:** Default Claude model may be Opus which is expensive for casual use. Set `CLAUDE_MODEL=sonnet` for everyday phone-control tasks.
-
-> **Security note:** `bypassPermissions` allows the CLI to run any command without approval. Only use on a machine you control, behind Feishu user whitelist.
-
-## 2) Configure
-
-Edit `.env`:
-
-- `FEISHU_APP_ID`
-- `FEISHU_APP_SECRET`
-- `FEISHU_HTTP_TIMEOUT_SEC=20` (avoid long blocking when Feishu API/network is unstable)
-- `OPENAI_API_KEY` (optional; if empty, service uses echo reply)
-- `ALLOWED_USER_IDS` (comma-separated Feishu `open_id`, e.g. `ou_xxx,ou_yyy`)
-- `USE_CODEX_CLI=true` (default; prefer local codex CLI)
-- `CODEX_WORKDIR=${WORKSPACE_ROOT}` (codex execution root)
-- `CODEX_PROJECT_ROOT=${WORKSPACE_ROOT}` (飞书里“新建项目”默认落地目录)
-- `CODEX_SANDBOX=workspace-write` (allow writing inside `CODEX_WORKDIR`)
-- `CODEX_ADD_DIRS=` (optional comma-separated extra writable dirs)
-- `CODEX_RESUME_ENABLED=true` (recommended; reuse per-user Codex thread for context continuity)
-- `CODEX_THREAD_STATE_FILE=.state/codex_threads.json` (store per-user Codex session ids)
-- `CODEX_MEMORY_ENABLED=true` (recommended; local fallback memory when a fresh thread is created)
-- `CODEX_MEMORY_TURNS=6` (keep recent N turns, each turn=user+assistant)
-- `CODEX_MEMORY_STATE_FILE=.state/codex_memory.json` (store per-user short memory)
-- `CODEX_STATUS_UPDATE_ENABLED=true` (send in-place status updates while task is running)
-- `CODEX_STATUS_POLL_SEC=3` (status check + update interval in seconds)
-- `CODEX_STATUS_FOLLOWUP_SEC=30` (fallback status push interval after edit-limit error)
-- `DEDUPE_TTL_SEC=900` and `DEDUPE_MAX_IDS=2000` (duplicate suppression window/cache size)
-
-Tip:
-- send `/reset` (or `重置会话` / `清空记忆`) in Feishu to clear both thread + local memory for your account.
-- send `/status` (or `状态` / `进度` / `任务进度`) in Feishu to check the current task stage without interrupting the running task.
-- send `过程日志` (or `trace` / `思考日志` / `进展日志`) in Feishu to inspect observable task progress: stage changes, visible Codex events, tool summaries, and completion state. Hidden model chain-of-thought is not exposed.
-- send `桌面 Codex 进度` (or `桌面 Codex 状态`) in Feishu to inspect the latest non-bot Codex desktop session from `~/.codex/sessions` without starting a new Codex CLI task.
-- send `/logs` (or `最新日志` / `查看日志` / `错误日志`) in Feishu to get sanitized recent bot logs without invoking Codex. Use `桌面日志` / `Codex 日志` to read a compact latest Codex desktop task transcript, for example `桌面日志 10条`; use `扩展日志` to read the lower-level VS Code extension log.
-
-## 3) Run
+### Run
 
 ```bash
-cd "$PROJECT_DIR"
+# Direct
 python3 ws_bot.py
-```
 
-Run as launchd service (recommended):
-
-```bash
-cd "$PROJECT_DIR"
+# As launchd service (recommended)
 ./scripts/launchd_manage.sh start
-```
-
-Stop service:
-
-```bash
-cd "$PROJECT_DIR"
+./scripts/launchd_manage.sh status
 ./scripts/launchd_manage.sh stop
 ```
 
-Check service status:
+### Message Prefixes
+
+| Prefix | Effect |
+|--------|--------|
+| (none) | Default backend (Claude) |
+| `/cc` | Force Claude Code |
+| `/codex` | Force Codex |
+| `/team <msg>` | Force team mode |
+| `/reset` | Clear session + memory |
+
+---
+
+## 中文
+
+多通道 AI Bot 桥接服务，连接**飞书**和**微信**到**Claude Code CLI**，实现手机端远程控制开发环境。
+
+### 功能特性
+
+- **双通道**：飞书（WebSocket 长连接）+ 微信（ilinkai API 长轮询）
+- **Claude Code 持久进程**：双向 stream-json，跨消息保持上下文
+- **多 Agent 团队模式**：调度员(Claude) + 执行者(Claude Code + DeepSeek) + 审查员(Claude)
+- **TDD 工作流**：执行前自动生成测试，执行后验证
+- **Harness 合规**：遵循 H0-H6 workspace skill harness 规范
+- **Session 预热**：bot 启动时立即预热 Claude 进程，首条消息到达时已就绪
+- **Watchdog 守护**：检测僵死进程（90s 无输出）→ 自动 kill + 重启（带 backoff）
+- **统一消息队列**：平台无关的任务处理，内置去重
+
+### 架构
+
+```
+┌──────────┐  ┌──────────┐  ┌──────────┐
+│   飞书    │  │   微信    │  │  未来平台  │
+└─────┬────┘  └─────┬────┘  └─────┬────┘
+      │              │              │
+      └──────┬───────┘──────────────┘
+             ▼
+    ┌─────────────────┐
+    │   消息队列       │   统一任务处理
+    └────────┬────────┘
+             │
+     ┌───────┴────────┐
+     │   路由器        │   关键词 → skill / 团队 / 单次
+     └───────┬────────┘
+             │
+    ┌────────┴─────────┐
+    │ 单次: Claude 直答  │   直接回复（可读写文件、运行命令）
+    │ 团队: 多Agent协作  │   调度 → 执行 → 审查
+    └──────────────────┘
+```
+
+### 多 Agent 团队模式
+
+开发任务自动触发，或手动 `/team <需求>` 强制进入。
+
+```
+用户发送任务
+  → H0: 调度员分析需求 + 风险评估
+  → 用户确认需求理解
+  → H2: 调度员制定执行计划（含验收标准）
+  → 用户确认计划
+  → H3: 逐步执行（TDD）:
+       1. 根据验收标准生成测试
+       2. DeepSeek 生成方案（顾问）
+       3. Claude Code 执行（真实文件操作）
+       4. 运行预生成测试
+       5. 验证步骤输出
+  → H4: 最终审查（审查员）
+  → H5: 结构化交付报告
+  → H6: 事后经验记录
+```
+
+### 文件结构
+
+```
+ws_bot.py           → 入口：路由、事件处理、main()
+config.py           → 配置(Settings)、回复结果(ReplyResult)
+feishu_api.py       → 飞书 IM API（发送/更新消息）
+state.py            → 状态管理（会话/记忆/session）
+text_utils.py       → 文本解析、命令识别
+log_viewer.py       → 日志/状态/trace 格式化
+codex_runner.py     → Codex CLI 执行器
+claude_session.py   → Claude 持久进程（stream-json 双向通信）
+message_queue.py    → 统一消息队列
+multi_agent.py      → 团队模式编排（TDD）
+wx_channel.py       → 微信通道（ilinkai 长轮询）
+```
+
+### 安装
 
 ```bash
-cd "$PROJECT_DIR"
+cd feishu-bot-bridge
+python3 -m pip install -r requirements.txt
+cp .env.example .env
+# 编辑 .env 填入凭证
+```
+
+`.env` 必填项：
+- `FEISHU_APP_ID` / `FEISHU_APP_SECRET` — 飞书开放平台
+- `CLAUDE_CODE_OAUTH_TOKEN` — 通过 `claude setup-token` 获取
+- `ALLOWED_USER_IDS` — 飞书 open_id 白名单
+
+可选项：
+- `WX_BOT_ENABLED=true` + `WX_BOT_TOKEN` — 启用微信通道
+- `DEEPSEEK_API_KEY` — 启用 DeepSeek 顾问（团队模式）
+- 代理设置（`http_proxy`, `https_proxy`）— 墙内必须配置
+
+### 运行
+
+```bash
+# 直接运行
+python3 ws_bot.py
+
+# launchd 服务（推荐）
+./scripts/launchd_manage.sh start
 ./scripts/launchd_manage.sh status
+./scripts/launchd_manage.sh stop
 ```
 
-View fixed logs:
-
-```bash
-cd "$PROJECT_DIR"
-./scripts/launchd_manage.sh logs
-```
-
-## 3.1 Daily Auto Report (Feishu + Memory)
-
-Configure in `.env`:
-
-- `DAILY_REPORT_HOUR` / `DAILY_REPORT_MINUTE` (default `22:30`)
-- `DAILY_REPORT_DATE_MODE=today|yesterday`
-- `DAILY_REPORT_SEND_OPEN_ID` (if empty, fallback to first `ALLOWED_USER_IDS`)
-- `DAILY_REPORT_WORKSPACE_ROOT` (memory root)
-- `DAILY_REPORT_SESSIONS_DIR` (session source)
-- `DAILY_REPORT_CURRENT_WORKDIR`（当前工作窗口目录，用于日报附加 Git/改动快照）
-- `DAILY_REPORT_SCOPE`（日报范围，逗号分隔）
-  - 默认：`codex_snapshot,work_snapshot`
-  - 可选：`session_summary,codex_snapshot,work_snapshot`
-
-Start scheduled task:
-
-```bash
-cd "$PROJECT_DIR"
-./scripts/launchd_daily_report.sh start
-```
-
-Check / stop:
-
-```bash
-./scripts/launchd_daily_report.sh status
-./scripts/launchd_daily_report.sh stop
-```
-
-Dry run (generate only, no Feishu send):
-
-```bash
-./scripts/launchd_daily_report.sh dry-run
-```
-
-Run once immediately:
-
-```bash
-./scripts/launchd_daily_report.sh run-now
-```
-
-Task outputs:
-
-- report: `reports/daily-YYYY-MM-DD.md`
-- memory diary: `memory/diary/YYYY/daily/YYYY-MM-DD.md`
-- session-memory sync (if available): `memory/YYYY-MM-DD.md`
-
-Daily report includes:
-
-- content controlled by `DAILY_REPORT_SCOPE`
-- `session_summary`: session summary from local Codex session logs
-- `codex_snapshot`: local Codex runtime snapshot (`.state/codex_threads.json` / `.state/codex_memory.json`)
-- `work_snapshot`: current workdir snapshot (git branch / uncommitted changes / commits of the day)
-
-## 3.2 Daily Opportunity Scout (08:00 Feishu + Local Codex)
-
-Configure in `.env`:
-
-- `SCOUT_REPORT_HOUR` / `SCOUT_REPORT_MINUTE` (default `08:00`)
-- `SCOUT_SEND_OPEN_ID` (if empty, fallback to `DAILY_REPORT_SEND_OPEN_ID`, then first `ALLOWED_USER_IDS`)
-- `SCOUT_CODEX_MODEL` (optional; fallback to `CODEX_MODEL`)
-- `SCOUT_CODEX_TIMEOUT_SEC` (default `900`)
-- `SCOUT_TARGET_MARKET=global_en`
-- `SCOUT_REPORT_LANGUAGE=zh-CN`
-- `SCOUT_FALLBACK_POLICY=send_low_confidence`
-- `SCOUT_NOVELTY_LOOKBACK_DAYS=3` (去重参考天数，读取最近报告做“题材去重”)
-- `SCOUT_NOVELTY_MAX_PENALTY=0.7` (新颖性惩罚上限，越大越倾向避开重复题材)
-- `SCOUT_MIN_PAY_SIGNAL=3` (最低付费信号分；低于阈值自动降级为 Low Confidence)
-- `SCOUT_MIN_COMMERCIAL_SCORE=3.0` (最低商业清晰度分；综合“付费信号+任务频率”)
-- `SCOUT_HUNT_ROUNDS=1` (Phase A 调研轮次；>1 时会多轮检索并合并去重后再选最高分)
-- `SCOUT_OUTPUT_DIR=${PROJECT_DIR}/reports/opportunity-scout`
-- `SCOUT_JOB_LOCK_FILE=${PROJECT_DIR}/.state/opportunity_scout_job.lock` (防并发重跑)
-- `SCOUT_WATCHDOG_INTERVAL_SEC=360` (boot 后每 6 分钟巡检一次)
-- `SCOUT_WATCHDOG_GRACE_MIN=20` (超过计划时间后多少分钟开始判定“漏跑”)
-- `SCOUT_WATCHDOG_CODEX_TIMEOUT_SEC=1800` (watchdog 补跑的超时保护；仅在 `SCOUT_CODEX_TIMEOUT_SEC<=0` 时生效)
-- `SCOUT_WATCHDOG_STATE_FILE=${PROJECT_DIR}/.state/opportunity_scout_watchdog.json`
-
-Runtime behavior:
-
-- runs local `codex exec --search` in read-only mode for both research phases
-- does not require `OPENAI_API_KEY` for the scout task
-- still uses Feishu HTTP API to send the final report
-- phase A 会读取最近 `SCOUT_NOVELTY_LOOKBACK_DAYS` 的已选机会，提示模型优先避开同题材
-- 本地排序会对“与近期机会高度相似”的候选加惩罚分（同源域名/同主题词/同集群）
-- phase A 额外提取 ICP/付费信号字段（persona、frequency、current spend/workaround、switch trigger）
-- 本地评分增加商业可行性维度，优先“有明确付费动机 + 高频痛点 + 单人可交付”的机会
-- 当 `SCOUT_HUNT_ROUNDS>1` 时：执行多轮调研、按 URL/题材去重、统一排序，仅输出最高分机会报告
-
-Start scheduled task:
-
-```bash
-cd "$PROJECT_DIR"
-./scripts/launchd_opportunity_scout.sh start
-```
-
-Watchdog behavior:
-
-- boot 后立即执行一次检查，之后每 6 分钟检查一次
-- 若当天 `08:00`（加 `SCOUT_WATCHDOG_GRACE_MIN` 缓冲）后仍未产出 `YYYY-MM-DD.md/.json`，自动补跑一次
-- 若补跑失败，向飞书发送失败告警消息
-- 若已有 scout 任务在跑，watchdog 会跳过本次补跑，避免并发重复执行
-
-Check / stop:
-
-```bash
-./scripts/launchd_opportunity_scout.sh status
-./scripts/launchd_opportunity_scout.sh stop
-```
-
-Dry run (generate only, no Feishu send):
-
-```bash
-./scripts/launchd_opportunity_scout.sh dry-run
-```
-
-Run once immediately:
-
-```bash
-./scripts/launchd_opportunity_scout.sh run-now
-```
-
-Task outputs:
-
-- markdown report: `reports/opportunity-scout/YYYY-MM-DD.md`
-- research JSON: `reports/opportunity-scout/YYYY-MM-DD.json`
-
-## 3.3 BOSS Mac App Semi-Auto Screening
-
-Use `boss-operator` recipe-first workflow in a semi-auto Mac App mode:
-
-- only search/screen jobs (no auto apply / no auto message)
-- manual checkpoints for login/captcha/risk-control popups
-- fail-fast on not-found steps (record then move to next keyword, no retry)
-
-Configure in `.env`:
-
-- `BOSS_OUTPUT_DIR=${PROJECT_DIR}/reports/boss-screening`
-- `BOSS_OPERATOR_RECIPE_PATH=${WORKSPACE_ROOT}/.codex/skills/boss-operator/assets/recipes/boss-web-job-hunt.json`
-- `BOSS_RESUME_PATH` (used to auto-extract suggested keywords)
-- `BOSS_CITIES=上海,杭州`
-- `BOSS_KEYWORDS` (optional override, comma-separated)
-- `BOSS_SALARY_RANGE=25-50K`
-- `BOSS_EXPERIENCE_RANGE=3-10年`
-- `BOSS_MAX_PAGES_PER_QUERY=3`
-- `BOSS_TOP_K=30`
-
-Dry run (generate plan/output skeleton only):
-
-```bash
-cd "$PROJECT_DIR"
-python3 scripts/boss_semiauto_screening.py --dry-run
-```
-
-Run semi-auto collection (interactive checkpoints):
-
-```bash
-cd "$PROJECT_DIR"
-python3 scripts/boss_semiauto_screening.py
-```
-
-Run with pre-collected raw input:
-
-```bash
-cd "$PROJECT_DIR"
-python3 scripts/boss_semiauto_screening.py --raw-input /path/to/jobs.json
-```
-
-Task outputs:
-
-- plan: `reports/boss-screening/YYYY-MM-DD/boss_plan.md`
-- raw data: `reports/boss-screening/YYYY-MM-DD/boss_jobs_raw.json`
-- ranked list: `reports/boss-screening/YYYY-MM-DD/boss_jobs_ranked.md`
-
-## 3.4 Xiaohongshu AI Blogger Daily Ops (Feishu + Local Codex)
-
-Configure in `.env`:
-
-- `XHS_REPORT_HOUR` / `XHS_REPORT_MINUTE` (default `09:00`)
-- `XHS_SEND_OPEN_ID` (if empty, fallback to `DAILY_REPORT_SEND_OPEN_ID`, then first `ALLOWED_USER_IDS`)
-- `XHS_CODEX_MODEL` (optional; fallback to `CODEX_MODEL`)
-- `XHS_CODEX_TIMEOUT_SEC` (default `900`)
-- `XHS_NICHE` / `XHS_TARGET_PERSONA` / `XHS_MONETIZATION_GOAL`
-- `XHS_BRAND_VOICE` (daily note writing tone)
-- `XHS_PUBLISH_WINDOWS=12:30,18:30,21:30`
-- `XHS_MAX_POSTS_PER_DAY` / `XHS_MAX_COMMENTS_PER_DAY`
-- `XHS_COMMENTS_PER_TOPIC=2`
-- `XHS_SIGNAL_MIN_COUNT` (below threshold => `Low Confidence`)
-- `XHS_FALLBACK_POLICY=send_low_confidence`
-- `XHS_OUTPUT_DIR=${PROJECT_DIR}/reports/xhs-ai-blogger`
-- `XHS_COVER_ENABLED=true` (固定单图封面发布链路开关)
-- `XHS_COVER_OUTPUT_DIR=${PROJECT_DIR}/reports/xhs-ai-blogger/assets`
-- `XHS_COVER_TEMPLATE=minimal_v1`
-- `XHS_COVER_SCRIPT=${PROJECT_DIR}/scripts/xhs_cover_generator.py`
-- `XHS_COVER_PROVIDER=auto|codex_skill|local`（默认 `auto`：先尝试技能，失败回退本地生成）
-- `XHS_COVER_SKILL_PRIMARY=xiaohongshu-images`
-- `XHS_COVER_SKILL_SECONDARY=image-generation-mcp`
-- `XHS_COVER_SKILL_REQUIRED=true|false`（为 `true` 时技能失败直接报错，不走回退）
-- `XHS_COVER_SKILL_FALLBACK_LOCAL=true|false`
-- `XHS_COVER_SKILL_TIMEOUT_SEC=1200`
-- `XHS_JOB_LOCK_FILE=${PROJECT_DIR}/.state/xhs_ai_blogger_job.lock`
-- `XHS_EXECUTOR_ENABLED=true|false`
-- `XHS_EXECUTOR_MODE=queue_only|command_hooks`
-- `XHS_EXECUTOR_REQUIRE_APPROVAL=true|false`
-- `XHS_EXECUTOR_AUTO_APPROVE=true|false`
-- `XHS_EXECUTOR_SCRIPT=${PROJECT_DIR}/scripts/xhs_auto_executor.py`
-- `XHS_PUBLISH_DRIVER=auto|post_to_xhs|command_hooks`（推荐 `auto`）
-- `XHS_POST_TO_XHS_SCRIPT=${HOME}/.codex/skills/post-to-xhs/scripts/publish_pipeline.py`
-- `XHS_POST_TO_XHS_HEADLESS=true|false`
-- `XHS_POST_TO_XHS_AUTO_PUBLISH=true|false`
-- `XHS_POST_TO_XHS_MODE=image-text|long-article`
-- `XHS_POST_TO_XHS_ACCOUNT=`（可选，指定 skill 内账号名）
-- `XHS_AUTH_MODE=web_session` (recommended)
-- `XHS_SESSION_MAX_AGE_HOURS=72`
-- `XHS_SESSION_CHECK_REQUIRED=true|false`
-- `XHS_HOOK_SESSION_CHECK_CMD` (optional session validation hook)
-- `XHS_RELOGIN_HINT` (message shown when session expired)
-- `XHS_HOOK_PUBLISH_CMD` / `XHS_HOOK_COMMENT_CMD` (only for `command_hooks`)
-- `XHS_ACCOUNT_KEYCHAIN_SERVICE` / `XHS_ACCOUNT_KEYCHAIN_ACCOUNT`
-- `XHS_PYTHON_BIN`（可选，指定任务执行 Python；建议指向已安装 `Pillow` 的解释器）
-
-Runtime behavior:
-
-- Phase A: use local Codex + web search to collect trend signals (with URL/timestamp)
-- local scoring: relevance + monetization + freshness + competition
-- Phase B: generate note drafts + comment interaction plan
-- build execution queue (`publish` + `comment`) and write into report JSON
-- 每条 publish action 自动生成 1 张封面图，并写入 `action_queue[].images`
-- 封面生成支持技能链路：`xiaohongshu-images` -> `image-generation-mcp` -> 本地 `xhs_cover_generator.py`（可配置）
-- 发布执行支持 `post-to-xhs`：`XHS_PUBLISH_DRIVER=auto` 时，检测到 skill 即自动走该发布器
-- optional executor runs automatically after report generation (approval gate on by default)
-- 发布流程开启找不到即停策略（No Retry Policy）：元素缺失时当前动作立即失败并上报，不做同动作重试
-- when web session expires, task sends Feishu alert and pauses execution
-- output sections: `Today Objective` / `Selected Topics` / `Publishing Plan` / `Engagement Plan` / `Risk/Compliance Checks` / `KPI Snapshot` / `Reflection + Tomorrow Optimization`
-
-Start scheduled task:
-
-```bash
-cd "$PROJECT_DIR"
-./scripts/launchd_xhs_ai_blogger.sh start
-```
-
-Check / stop:
-
-```bash
-./scripts/launchd_xhs_ai_blogger.sh status
-./scripts/launchd_xhs_ai_blogger.sh stop
-```
-
-Dry run (generate only, no Feishu send):
-
-```bash
-./scripts/launchd_xhs_ai_blogger.sh dry-run
-```
-
-Run once immediately:
-
-```bash
-./scripts/launchd_xhs_ai_blogger.sh run-now
-```
-
-Task outputs:
-
-- markdown report: `reports/xhs-ai-blogger/YYYY-MM-DD.md`
-- research JSON: `reports/xhs-ai-blogger/YYYY-MM-DD.json`
-- executor result: `reports/xhs-ai-blogger/YYYY-MM-DD.execution.json` (when executor enabled)
-- cover assets: `reports/xhs-ai-blogger/assets/YYYY-MM-DD/cover-1.png`
-
-Configure XHS account in Keychain:
-
-```bash
-cd "$PROJECT_DIR"
-./scripts/xhs_web_session_auth.sh login --account-id <xhs_account_id> --username <login_name> --url https://creator.xiaohongshu.com/new/home
-./scripts/xhs_account_keychain.sh status
-```
-
-> `xhs_web_session_auth.sh` 会打开网页让你手动登录小红书，关闭浏览器后自动保存 `storage_state` 并写入 Keychain。
-
-Executor manual run:
-
-```bash
-cd "$PROJECT_DIR"
-python3 scripts/xhs_auto_executor.py --plan-json reports/xhs-ai-blogger/$(date +%F).json --approve
-```
-
-Generate one local cover manually:
-
-```bash
-cd "$PROJECT_DIR"
-python3 scripts/xhs_cover_generator.py --title "你的标题" --date "$(date +%F)" --keyword "AI提效" --output reports/xhs-ai-blogger/assets/$(date +%F)/cover-1.png
-```
-
-`command_hooks` mode example:
-
-```bash
-XHS_EXECUTOR_MODE=command_hooks
-XHS_HOOK_PUBLISH_CMD='python3 scripts/xhs_web_operator.py publish --storage-state {storage_state} --entry-url https://creator.xiaohongshu.com/new/home --publish-mode image_note --image-strategy text_card --title {title} --content {content} --images {images_csv} --topics {tags_csv} --headful --keep-open-on-fail --hold-seconds-on-fail 1800'
-XHS_HOOK_COMMENT_CMD='python3 scripts/xhs_web_operator.py comment --storage-state {storage_state} --browse-url https://www.xiaohongshu.com/explore --topic {topic} --comment {comment} --headful'
-# 常用占位符：{storage_state} {title} {content} {topic} {comment} {images_csv} {tags_csv}
-# publish 可选：--publish-mode image_note|long_article，--image-strategy text_card|upload
-```
-
-> 默认建议先用 `queue_only + require_approval=true` 跑通流程，再切换到 `command_hooks` 真执行。
-
-## 4) Feishu Console
-
-Use:
-- `Event configuration` -> `Receive events through persistent connection`
-
-Enable event:
-- `im.message.receive_v1`
-
-## 5) GitHub Token Storage (Keychain)
-
-For local GitHub automation, store PAT in macOS Keychain instead of `.env`:
-
-```bash
-cd "$PROJECT_DIR"
-./scripts/github_token_keychain.sh set <github_pat_xxx>
-./scripts/github_token_keychain.sh status
-```
-
-Available commands:
-
-```bash
-# Store / update token
-./scripts/github_token_keychain.sh set <github_pat_xxx>
-
-# Check whether token exists (does not print token)
-./scripts/github_token_keychain.sh status
-
-# Read token (for scripting only; avoid printing in shared terminals)
-./scripts/github_token_keychain.sh get
-
-# Delete token from keychain
-./scripts/github_token_keychain.sh delete
-```
-
-Optional environment variables:
-
-```bash
-export GITHUB_TOKEN_KEYCHAIN_SERVICE="feishu-bot-bridge.github.token"
-export GITHUB_TOKEN_KEYCHAIN_ACCOUNT="mzyag"
-```
-
-## 6) Cloud Server Credential Storage (Keychain)
-
-Store cloud server login credentials in macOS Keychain:
-
-```bash
-cd "$PROJECT_DIR"
-./scripts/cloud_server_keychain.sh set --host <ip-or-host> --user <username> --password '<password>'
-```
-
-Available commands:
-
-```bash
-# Example: save credentials
-./scripts/cloud_server_keychain.sh set --host <server-ip> --user <ssh-user> --password '<password>'
-
-# Check whether credentials exist (host/user shown, password masked)
-./scripts/cloud_server_keychain.sh status
-
-# Read full JSON payload (contains password; use carefully)
-./scripts/cloud_server_keychain.sh get
-
-# Delete credentials
-./scripts/cloud_server_keychain.sh delete
-```
-
-Optional environment variables:
-
-```bash
-export CLOUD_SERVER_KEYCHAIN_SERVICE="feishu-bot-bridge.cloud.server"
-export CLOUD_SERVER_KEYCHAIN_ACCOUNT="default"
-```
-
-## 7) Auto Sync + Security Policy (Required)
-
-Policy:
-- Every push must pass security scan.
-- After code commit, auto sync to GitHub.
-- If private information is detected, push is blocked until masked.
-
-Enable hooks once per clone:
-
-```bash
-cd "$PROJECT_DIR"
-git config core.hooksPath .githooks
-chmod +x .githooks/pre-push .githooks/post-commit scripts/security_scan_before_push.sh scripts/safe_sync_to_github.sh scripts/github_askpass.sh scripts/release.sh
-```
-
-Manual safe sync command:
-
-```bash
-# Scan -> commit (if needed) -> push
-./scripts/safe_sync_to_github.sh "chore: your commit message"
-```
-
-Security scan only:
-
-```bash
-./scripts/security_scan_before_push.sh
-```
-
-Optional controls:
-
-```bash
-# Disable auto push for current shell/session
-export AUTO_SYNC_TO_GITHUB=false
-```
-
-## 8) One-Click Release (`v0.x.y`)
-
-Release strategy:
-- Use semantic version tags in `v0.x.y` format.
-- Default bump is `patch` (for example, `v0.1.0 -> v0.1.1`).
-- The script enforces: clean working tree, security scan, sync `main`, tag push, then GitHub release creation.
-- Requires GitHub token in Keychain (`./scripts/github_token_keychain.sh set <github_pat_xxx>`).
-
-Create a patch release (default):
-
-```bash
-cd "$PROJECT_DIR"
-./scripts/release.sh
-```
-
-Create a minor/major release:
-
-```bash
-./scripts/release.sh --minor
-./scripts/release.sh --major
-```
-
-Set explicit version:
-
-```bash
-./scripts/release.sh --version v0.2.0
-```
-
-Optional release controls:
-
-```bash
-./scripts/release.sh --notes "Release highlights"
-./scripts/release.sh --notes-file ./release-notes.md
-./scripts/release.sh --draft
-./scripts/release.sh --prerelease
-./scripts/release.sh --no-generate-notes
-```
+### 消息前缀
+
+| 前缀 | 效果 |
+|------|------|
+| （无） | 默认后端（Claude） |
+| `/cc` | 强制 Claude Code |
+| `/codex` | 强制 Codex |
+| `/team <消息>` | 强制团队模式 |
+| `/reset` | 清空会话 + 记忆 |
+
+### 安全注意
+
+- `CLAUDE_PERMISSION_MODE=bypassPermissions` 允许 CLI 执行任何命令，仅在个人可控机器 + 白名单保护下使用
+- `.env` 含敏感凭证，已在 `.gitignore` 中，不会被提交
+- 空白名单 = 拒绝所有消息（fail-closed）

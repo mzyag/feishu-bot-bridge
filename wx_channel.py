@@ -38,6 +38,15 @@ class WxBotConfig:
 
 WX_CONFIG = WxBotConfig()
 
+_WX_HTTP: Optional[httpx.Client] = None
+
+
+def _get_wx_http() -> httpx.Client:
+    global _WX_HTTP
+    if _WX_HTTP is None or _WX_HTTP.is_closed:
+        _WX_HTTP = httpx.Client()
+    return _WX_HTTP
+
 
 def _random_wechat_uin() -> str:
     raw = struct.unpack(">I", os.urandom(4))[0]
@@ -63,12 +72,12 @@ def _base_info() -> dict:
 
 def wx_notify_start() -> bool:
     try:
-        with httpx.Client(timeout=10) as client:
-            resp = client.post(
-                f"{WX_CONFIG.base_url}/ilink/bot/msg/notifystart",
-                headers=_build_headers(),
-                json={"base_info": _base_info()},
-            )
+        resp = _get_wx_http().post(
+            f"{WX_CONFIG.base_url}/ilink/bot/msg/notifystart",
+            headers=_build_headers(),
+            json={"base_info": _base_info()},
+            timeout=10,
+        )
         return resp.status_code == 200
     except Exception as ex:
         print(f"[wx] notifyStart failed: {ex}")
@@ -77,12 +86,12 @@ def wx_notify_start() -> bool:
 
 def wx_notify_stop() -> None:
     try:
-        with httpx.Client(timeout=5) as client:
-            client.post(
-                f"{WX_CONFIG.base_url}/ilink/bot/msg/notifystop",
-                headers=_build_headers(),
-                json={"base_info": _base_info()},
-            )
+        _get_wx_http().post(
+            f"{WX_CONFIG.base_url}/ilink/bot/msg/notifystop",
+            headers=_build_headers(),
+            json={"base_info": _base_info()},
+            timeout=5,
+        )
     except Exception:
         pass
 
@@ -90,12 +99,12 @@ def wx_notify_stop() -> None:
 def wx_get_updates(get_updates_buf: str = "") -> dict:
     try:
         timeout_sec = WX_CONFIG.longpoll_timeout_ms / 1000 + 5
-        with httpx.Client(timeout=timeout_sec) as client:
-            resp = client.post(
-                f"{WX_CONFIG.base_url}/ilink/bot/getupdates",
-                headers=_build_headers(),
-                json={"get_updates_buf": get_updates_buf, "base_info": _base_info()},
-            )
+        resp = _get_wx_http().post(
+            f"{WX_CONFIG.base_url}/ilink/bot/getupdates",
+            headers=_build_headers(),
+            json={"get_updates_buf": get_updates_buf, "base_info": _base_info()},
+            timeout=timeout_sec,
+        )
         if resp.status_code == 200:
             return resp.json()
     except httpx.ReadTimeout:
@@ -118,12 +127,12 @@ def wx_send_text(to_user_id: str, text: str, context_token: str = "") -> bool:
     if context_token:
         msg["context_token"] = context_token
     try:
-        with httpx.Client(timeout=WX_CONFIG.timeout_ms / 1000) as client:
-            resp = client.post(
-                f"{WX_CONFIG.base_url}/ilink/bot/sendmessage",
-                headers=_build_headers(),
-                json={"msg": msg, "base_info": _base_info()},
-            )
+        resp = _get_wx_http().post(
+            f"{WX_CONFIG.base_url}/ilink/bot/sendmessage",
+            headers=_build_headers(),
+            json={"msg": msg, "base_info": _base_info()},
+            timeout=WX_CONFIG.timeout_ms / 1000,
+        )
         ok = resp.status_code == 200
         if not ok:
             print(f"[wx] sendMessage http_error: status={resp.status_code} body={resp.text[:200]}")
@@ -134,6 +143,7 @@ def wx_send_text(to_user_id: str, text: str, context_token: str = "") -> bool:
 
 
 _CONTEXT_TOKENS: Dict[str, str] = {}
+_CONTEXT_TOKENS_MAX = 200
 
 _WX_DEDUP_LOCK = threading.Lock()
 _WX_SEEN_MSG_IDS: Dict[str, float] = {}
@@ -230,6 +240,9 @@ def start_wx_channel(generate_reply_fn, reply_text_fn=None) -> Optional[threadin
 
                 ctx_token = msg.get("context_token", "")
                 if ctx_token:
+                    if len(_CONTEXT_TOKENS) >= _CONTEXT_TOKENS_MAX:
+                        oldest = next(iter(_CONTEXT_TOKENS))
+                        _CONTEXT_TOKENS.pop(oldest, None)
                     _CONTEXT_TOKENS[from_user] = ctx_token
 
                 user_text = _extract_text_from_message(msg)
@@ -243,7 +256,7 @@ def start_wx_channel(generate_reply_fn, reply_text_fn=None) -> Optional[threadin
                 def _make_wx_progress(uid: str, counter: list) -> callable:
                     def _progress(stage: str, detail: str = "") -> None:
                         try:
-                            from ws_bot import _CLAUDE_SESSION
+                            from claude_session import CLAUDE_SESSION as _CLAUDE_SESSION
                         except ImportError:
                             return
                         if not hasattr(_CLAUDE_SESSION, "_tool_log_lock"):
