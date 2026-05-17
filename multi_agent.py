@@ -17,6 +17,8 @@ from typing import Callable, Dict, List, Optional, Tuple
 import httpx
 from dotenv import load_dotenv
 
+from config import SETTINGS
+
 load_dotenv()
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
@@ -679,12 +681,29 @@ def _continue_execution(open_id: str, claude_session, notify_fn: Callable[[str],
         notify_fn(f"⚡ Step {step_num}/{len(steps)}: {title}")
         acceptance = step.get("acceptance", "")
 
-        # TDD Phase 1: Generate test FIRST (from acceptance criteria)
+        # Tool progress callback: sends real-time tool notifications during Claude execution
+        sub_step_counter = [0]
+        def _step_tool_progress(stage: str, detail: str = "") -> None:
+            from claude_session import CLAUDE_SESSION
+            if not hasattr(CLAUDE_SESSION, "_tool_log_lock"):
+                return
+            new_entries = []
+            with CLAUDE_SESSION._tool_log_lock:
+                current_count = len(CLAUDE_SESSION._tool_log)
+                if current_count > sub_step_counter[0]:
+                    new_entries = CLAUDE_SESSION._tool_log[sub_step_counter[0]:]
+                    sub_step_counter[0] = current_count
+            if new_entries:
+                notify_fn("\n".join(new_entries))
+
+        # TDD Phase 1: Generate test (Step N.1)
+        notify_fn(f"Step {step_num}.1 生成测试...")
         test_code = _generate_test_from_acceptance(step_num, title, task_desc, acceptance, claude_session)
         if test_code:
-            notify_fn(f"🧪 Step {step_num}: 测试已生成")
+            notify_fn(f"🧪 Step {step_num}.1 测试已生成")
 
-        # TDD Phase 2: Ask DeepSeek for code draft (advisor)
+        # TDD Phase 2: DeepSeek code draft (Step N.2)
+        notify_fn(f"Step {step_num}.2 DeepSeek 出方案...")
         ds_system = (
             "你是代码顾问。为任务输出完整的实现方案和代码片段。\n"
             "如果修改现有文件，给出具体的修改位置和代码。\n"
@@ -698,9 +717,14 @@ def _continue_execution(open_id: str, claude_session, notify_fn: Callable[[str],
         ds_ref = ""
         if ds_ok:
             ds_ref = f"\n\nDeepSeek 参考方案:\n{ds_output[:3000]}"
-            notify_fn(f"📝 Step {step_num}: DeepSeek 方案已生成")
+            notify_fn(f"📝 Step {step_num}.2 DeepSeek 方案已生成")
 
-        # TDD Phase 3: Claude Code executes (make the test pass)
+        # TDD Phase 3: Claude Code executes (Step N.3)
+        notify_fn(f"Step {step_num}.3 Claude 开始执行...")
+        # Reset tool counter so we capture tools from this execution
+        with claude_session._tool_log_lock:
+            sub_step_counter[0] = len(claude_session._tool_log)
+
         exec_prompt = (
             f"请执行以下任务。你可以读写文件、运行命令。\n\n"
             f"任务: {task_desc}\n上下文: {context}\n\n原始需求: {user_text}"
@@ -710,11 +734,19 @@ def _continue_execution(open_id: str, claude_session, notify_fn: Callable[[str],
         if test_code:
             exec_prompt += f"\n\n预定义测试（执行完后必须通过）:\n{test_code[:1500]}"
         exec_prompt += ds_ref
-        ok, code_output = call_claude_via_session(exec_prompt, claude_session)
+        # Pass progress callback so tool events push to user during execution
+        result = claude_session.send_message(
+            text=exec_prompt,
+            timeout_sec=SETTINGS.claude_timeout_sec,
+            progress_callback=_step_tool_progress,
+        )
+        ok = result.get("status") == "ok"
+        code_output = result.get("content", "") if ok else result.get("error", "Claude call failed")
+        claude_session._progress_callback = None
 
         if not ok:
             executor_results.append(f"### Step {step_num}: {title}\n\n❌ 执行失败: {code_output}")
-            notify_fn(f"❌ Step {step_num} 执行失败: {code_output[:80]}")
+            notify_fn(f"❌ Step {step_num}.3 执行失败: {code_output[:80]}")
             wf.setdefault("unfinished", []).append(f"Step {step_num}: {title}")
             _update_plan_step_status(wf, step_num, f"❌ 失败: {code_output[:40]}")
             current_step += 1
@@ -723,25 +755,28 @@ def _continue_execution(open_id: str, claude_session, notify_fn: Callable[[str],
             set_workflow(open_id, wf)
             continue
 
-        # TDD Phase 4: Run the pre-generated test
+        # TDD Phase 4: Run test (Step N.4)
         test_passed = True
         test_msg = ""
         if test_code:
+            notify_fn(f"Step {step_num}.4 运行测试...")
             test_passed, test_msg = _run_step_test(step_num, test_code, claude_session)
-            notify_fn(f"🧪 Step {step_num} 测试{'✓' if test_passed else '✗'} {test_msg[:40]}")
+            notify_fn(f"🧪 Step {step_num}.4 测试{'✓' if test_passed else '✗'} {test_msg[:40]}")
 
-        # H4 per-step validation (combines test result + LLM review)
+        # H4 per-step validation (Step N.5)
+        notify_fn(f"Step {step_num}.5 验证中...")
         if not test_passed:
             step_ok, check_msg = False, f"测试失败: {test_msg[:80]}"
         else:
             step_ok, check_msg = _validate_step(step_num, task_desc, code_output, claude_session, validation_method)
         if step_ok:
             executor_results.append(f"### Step {step_num}: {task_desc}\n\n{code_output}")
-            notify_fn(f"✅ Step {step_num} 验证通过 — {check_msg}")
+            notify_fn(f"✅ Step {step_num}.5 验证通过 — {check_msg}")
             _update_plan_step_status(wf, step_num, f"✅ 完成: {check_msg[:30]}")
         else:
             # Retry once with validation feedback (H4: return to H3, smallest fix)
-            notify_fn(f"⚠️ Step {step_num} 验证未通过: {check_msg}，修复中...")
+            notify_fn(f"⚠️ Step {step_num}.5 验证未通过: {check_msg}")
+            notify_fn(f"Step {step_num}.6 修复中...")
             fix_prompt = (
                 f"上一步执行结果验证未通过: {check_msg}\n"
                 f"原任务: {task_desc}\n请做最小修复。"
@@ -751,16 +786,16 @@ def _continue_execution(open_id: str, claude_session, notify_fn: Callable[[str],
                 fix_ok, fix_msg = _validate_step(step_num, task_desc, fix_output, claude_session, validation_method)
                 if fix_ok:
                     executor_results.append(f"### Step {step_num}: {task_desc}\n\n{fix_output}")
-                    notify_fn(f"✅ Step {step_num} 修复通过 — {fix_msg}")
+                    notify_fn(f"✅ Step {step_num}.6 修复通过 — {fix_msg}")
                     _update_plan_step_status(wf, step_num, f"✅ 修复后通过: {fix_msg[:30]}")
                 else:
                     executor_results.append(f"### Step {step_num}: {task_desc}\n\n{fix_output}\n\n> ⚠️ 验证仍未通过: {fix_msg}（停止条件: 最多重试1次）")
-                    notify_fn(f"⚠️ Step {step_num} 修复后仍有问题（停止: 重试上限），继续下一步")
+                    notify_fn(f"⚠️ Step {step_num}.6 修复后仍有问题，继续下一步")
                     wf.setdefault("validation_failures", []).append({"step": step_num, "issue": check_msg, "retry_issue": fix_msg})
                     _update_plan_step_status(wf, step_num, f"⚠️ 验证未通过: {check_msg[:30]}")
             else:
                 executor_results.append(f"### Step {step_num}: {task_desc}\n\n{code_output}\n\n> ⚠️ 修复失败")
-                notify_fn(f"⚠️ Step {step_num} 修复失败，保留原输出继续")
+                notify_fn(f"⚠️ Step {step_num}.6 修复失败，保留原输出继续")
                 wf.setdefault("validation_failures", []).append({"step": step_num, "issue": check_msg})
                 _update_plan_step_status(wf, step_num, f"⚠️ 修复失败: {check_msg[:30]}")
 

@@ -300,7 +300,8 @@ class ClaudePersistentSession:
                     self._restart_backoff = min(self._restart_backoff * 2, 30.0)
                     return {"status": "error", "error": "未找到 claude 命令或启动失败"}
 
-        self._progress_callback = progress_callback
+        if progress_callback is not None:
+            self._progress_callback = progress_callback
         self._last_stdout_ts = time.time()
 
         msg = {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": text}]}}
@@ -348,7 +349,8 @@ class ClaudePersistentSession:
                 try:
                     result = self._result_queue.get(timeout=1.0)
                     content = str(result.get("result", "")).strip()
-                    self._progress_callback = None
+                    if progress_callback is not None:
+                        self._progress_callback = None
                     with self._tool_log_lock:
                         tool_log = list(self._tool_log)
                     if result.get("is_error") or result.get("subtype") != "success":
