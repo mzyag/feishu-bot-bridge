@@ -652,10 +652,70 @@ def _execute_from_plan(open_id: str, claude_session, notify_fn: Callable[[str], 
     wf = get_workflow(open_id)
     if not wf:
         return "工作流状态丢失"
+
+    # Pre-flight: verify resources before executing
+    blockers = _run_preflight(wf, claude_session, notify_fn)
+    if blockers:
+        return blockers
+
     wf["phase"] = "executing"
     wf["current_step"] = 0
     set_workflow(open_id, wf)
     return _continue_execution(open_id, claude_session, notify_fn)
+
+
+def _run_preflight(wf: dict, claude_session, notify_fn: Callable[[str], None]) -> Optional[str]:
+    """Pre-flight check: derive requirements from plan, verify silently, ask user only for hard blockers."""
+    plan = wf.get("plan", {})
+    steps = plan.get("plan", [])
+    if not steps:
+        return None
+
+    all_context = " ".join(s.get("context", "") + " " + s.get("detail", "") + " " + s.get("task", "") for s in steps)
+    files_affected = plan.get("files_affected", [])
+
+    notify_fn("🔍 执行前检查...")
+
+    preflight_prompt = (
+        "我即将执行以下计划，请帮我做前置检查（pre-flight）。\n"
+        "静默检查以下内容，直接执行命令验证，不要问我：\n\n"
+        "1. 计划涉及的文件/目录是否存在、是否有写入权限\n"
+        "2. 需要的工具是否安装（git, node, python, docker, sshpass 等）\n"
+        "3. 如果涉及服务器操作：能否 SSH 连通（在项目目录和 .env 文件里找服务器信息）\n"
+        "4. 如果涉及 git：当前分支状态是否 clean\n"
+        "5. 如果涉及 API/密钥：相关 .env 或配置文件里有没有\n\n"
+        f"计划内容：\n{all_context[:1500]}\n"
+        f"涉及文件：{files_affected}\n\n"
+        "只回复 JSON：\n"
+        '{"ok": true} 如果全部通过\n'
+        '{"ok": false, "blockers": ["缺少xxx", "无法连接xxx"]} 如果有硬阻塞\n'
+        '{"ok": true, "warnings": ["xxx可能有问题"]} 如果有软警告但可以继续'
+    )
+
+    ok, resp = call_claude_via_session(preflight_prompt, claude_session, timeout_sec=60)
+    if not ok:
+        return None
+
+    data = _extract_json_from_response(resp)
+    if not data:
+        return None
+
+    if data.get("ok"):
+        warnings = data.get("warnings", [])
+        if warnings:
+            notify_fn("⚠️ 前置检查警告: " + "; ".join(warnings))
+        else:
+            notify_fn("✅ 前置检查通过")
+        return None
+
+    blockers = data.get("blockers", [])
+    if blockers:
+        msg = "❌ 前置检查失败:\n" + "\n".join(f"- {b}" for b in blockers)
+        msg += "\n\n请提供缺少的信息后重试。"
+        clear_workflow(wf.get("open_id", ""))
+        return msg
+
+    return None
 
 
 def _continue_execution(open_id: str, claude_session, notify_fn: Callable[[str], None]) -> str:
