@@ -253,6 +253,8 @@ def wx_send_text(to_user_id: str, text: str, context_token: str = "", priority: 
 
 
 _CONTEXT_TOKENS: Dict[str, str] = {}
+_CONTEXT_TOKEN_TS: Dict[str, float] = {}
+_CONTEXT_TOKEN_MAX_AGE = 55.0
 _CONTEXT_TOKENS_MAX = 200
 
 _WX_DEDUP_LOCK = threading.Lock()
@@ -315,7 +317,12 @@ def start_wx_channel(generate_reply_fn, reply_text_fn=None) -> Optional[threadin
     from message_queue import message_queue, MessageTask
 
     def _wx_reply(user_id: str, text: str, priority: bool = False) -> None:
-        ctx = _CONTEXT_TOKENS.get(user_id, "")
+        ctx = ""
+        token_ts = _CONTEXT_TOKEN_TS.get(user_id, 0)
+        if time.time() - token_ts <= _CONTEXT_TOKEN_MAX_AGE:
+            ctx = _CONTEXT_TOKENS.get(user_id, "")
+        else:
+            print(f"[wx] context_token expired ({time.time() - token_ts:.0f}s old), sending without")
         wx_send_text(user_id, text, ctx, priority=priority)
 
     def _poll_loop() -> None:
@@ -349,12 +356,10 @@ def start_wx_channel(generate_reply_fn, reply_text_fn=None) -> Optional[threadin
                     continue
 
                 ctx_token = msg.get("context_token", "")
-                print(f"[wx] context_token: {'present' if ctx_token else 'MISSING'} for {from_user[:20]}")
                 if ctx_token:
-                    if len(_CONTEXT_TOKENS) >= _CONTEXT_TOKENS_MAX:
-                        oldest = next(iter(_CONTEXT_TOKENS))
-                        _CONTEXT_TOKENS.pop(oldest, None)
                     _CONTEXT_TOKENS[from_user] = ctx_token
+                    _CONTEXT_TOKEN_TS[from_user] = time.time()
+                    print(f"[wx] context_token refreshed for {from_user[:20]}")
 
                 user_text = _extract_text_from_message(msg)
                 if not user_text:

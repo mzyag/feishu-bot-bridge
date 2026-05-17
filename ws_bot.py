@@ -111,8 +111,12 @@ def _is_wx_user(open_id: str) -> bool:
 def _send_to_user(open_id: str, text: str) -> None:
     if _is_wx_user(open_id):
         try:
-            from wx_channel import wx_send_text, _CONTEXT_TOKENS
-            ctx = _CONTEXT_TOKENS.get(open_id, "")
+            from wx_channel import wx_send_text, _CONTEXT_TOKENS, _CONTEXT_TOKEN_TS, _CONTEXT_TOKEN_MAX_AGE
+            import time as _t
+            ctx = ""
+            token_ts = _CONTEXT_TOKEN_TS.get(open_id, 0)
+            if _t.time() - token_ts <= _CONTEXT_TOKEN_MAX_AGE:
+                ctx = _CONTEXT_TOKENS.get(open_id, "")
             ok = wx_send_text(open_id, text, ctx)
             if not ok:
                 lark.logger.warning("[send_to_user] wx_send_text failed for: %s", text[:60])
@@ -288,22 +292,22 @@ def do_p2_im_message_receive_v1(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
 
     if is_desktop_codex_status_command(user_text):
         lark.logger.info("desktop codex status requested by %s", open_id)
-        reply_text(open_id, format_desktop_codex_status(user_text))
+        _send_to_user(open_id, format_desktop_codex_status(user_text))
         return
 
     if is_status_command(user_text):
         lark.logger.info("status requested by %s", open_id)
-        reply_text(open_id, format_user_status(open_id))
+        _send_to_user(open_id, format_user_status(open_id))
         return
 
     if is_trace_command(user_text):
         lark.logger.info("trace requested by %s", open_id)
-        reply_text(open_id, format_task_trace(open_id, user_text))
+        _send_to_user(open_id, format_task_trace(open_id, user_text))
         return
 
     if is_logs_command(user_text):
         lark.logger.info("logs requested by %s", open_id)
-        reply_text(open_id, format_recent_logs(user_text))
+        _send_to_user(open_id, format_recent_logs(user_text))
         return
 
     if user_text.strip() == "/retry":
@@ -315,11 +319,11 @@ def do_p2_im_message_receive_v1(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
                 source="feishu",
                 user_id=open_id,
                 text=resume_text,
-                reply_fn=lambda text: reply_text(open_id, text),
+                reply_fn=lambda text: _send_to_user(open_id, text),
                 generate_reply_fn=_generate_reply,
             ))
         else:
-            reply_text(open_id, "没有可恢复的中断任务。")
+            _send_to_user(open_id, "没有可恢复的中断任务。")
         return
 
     if user_text.strip().startswith("/review"):
@@ -327,76 +331,33 @@ def do_p2_im_message_receive_v1(data: lark.im.v1.P2ImMessageReceiveV1) -> None:
         eps = get_unreviewed_episodes(open_id)
         if eps:
             lines = [f"[{e.get('id','')}] {e.get('outcome','')} — {e.get('user_goal','')[:50]}" for e in eps]
-            reply_text(open_id, "待审阅的学习记录:\n" + "\n".join(lines))
+            _send_to_user(open_id, "待审阅的学习记录:\n" + "\n".join(lines))
         else:
-            reply_text(open_id, "没有待审阅的学习记录。")
+            _send_to_user(open_id, "没有待审阅的学习记录。")
         return
 
     if user_text.strip().startswith("/promote "):
         from memory import promote_episode
         ep_id = user_text.strip()[9:].strip()
         ok = promote_episode(open_id, ep_id)
-        reply_text(open_id, f"✅ 已提升: {ep_id}" if ok else f"❌ 未找到: {ep_id}")
+        _send_to_user(open_id, f"✅ 已提升: {ep_id}" if ok else f"❌ 未找到: {ep_id}")
         return
 
     if user_text.strip().startswith("/reject "):
         from memory import reject_episode
         ep_id = user_text.strip()[8:].strip()
         ok = reject_episode(open_id, ep_id)
-        reply_text(open_id, f"✅ 已拒绝: {ep_id}" if ok else f"❌ 未找到: {ep_id}")
+        _send_to_user(open_id, f"✅ 已拒绝: {ep_id}" if ok else f"❌ 未找到: {ep_id}")
         return
 
     lark.logger.info("received message from %s: %s", open_id, user_text[:120])
-
-    import time as _time
-
-    class _FeishuDraftReply:
-        def __init__(self, oid):
-            self._open_id = oid
-            self._message_id = None
-            self._last_edit_ts = 0.0
-            self._accumulated = ""
-
-        def __call__(self, text):
-            now = _time.time()
-            if self._message_id is None:
-                self._message_id = reply_text(self._open_id, text)
-                self._accumulated = text
-                self._last_edit_ts = now
-            else:
-                self._accumulated = text
-                if now - self._last_edit_ts >= 0.5:
-                    ok, _ = update_text_message(self._message_id, text)
-                    if ok:
-                        self._last_edit_ts = now
-                    else:
-                        self._message_id = reply_text(self._open_id, text)
-                        self._last_edit_ts = now
-
-    draft_reply = _FeishuDraftReply(open_id)
-
-    last_tool_count = [0]
-
-    def _feishu_progress(stage: str, detail: str = "") -> None:
-        if not hasattr(CLAUDE_SESSION, "_tool_log_lock"):
-            return
-        new_entries = []
-        with CLAUDE_SESSION._tool_log_lock:
-            current_count = len(CLAUDE_SESSION._tool_log)
-            if current_count > last_tool_count[0]:
-                new_entries = CLAUDE_SESSION._tool_log[last_tool_count[0]:]
-                last_tool_count[0] = current_count
-        if new_entries:
-            progress_text = "\n".join(new_entries)
-            draft_reply(progress_text)
 
     message_queue.enqueue(MessageTask(
         source="feishu",
         user_id=open_id,
         text=user_text,
-        reply_fn=draft_reply,
+        reply_fn=lambda text: _send_to_user(open_id, text),
         generate_reply_fn=_generate_reply,
-        on_progress=_feishu_progress,
     ))
 
 
