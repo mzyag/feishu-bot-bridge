@@ -255,7 +255,7 @@ class ClaudePersistentSession:
         except Exception:
             pass
 
-    _STALL_TIMEOUT = 90
+    _STALL_TIMEOUT = 300
 
     def is_alive(self) -> bool:
         if not self._alive or self._proc is None or self._proc.poll() is not None:
