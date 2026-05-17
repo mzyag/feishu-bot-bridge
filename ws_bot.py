@@ -72,6 +72,9 @@ _SKILL_TRIGGERS = {
     "merge": "git-essentials",
     "rebase": "git-essentials",
     "cherry-pick": "git-essentials",
+    "提交": "git-essentials",
+    "推送": "git-essentials",
+    "同步到github": "git-essentials",
     "gitee": "data-catalog-gitee-push",
     "data-catalog": "data-catalog-gitee-push",
     "安全审计": "security-audit",
@@ -110,9 +113,11 @@ def _send_to_user(open_id: str, text: str) -> None:
         try:
             from wx_channel import wx_send_text, _CONTEXT_TOKENS
             ctx = _CONTEXT_TOKENS.get(open_id, "")
-            wx_send_text(open_id, text, ctx)
-        except Exception:
-            pass
+            ok = wx_send_text(open_id, text, ctx)
+            if not ok:
+                lark.logger.warning("[send_to_user] wx_send_text failed for: %s", text[:60])
+        except Exception as ex:
+            lark.logger.warning("[send_to_user] wx exception: %s, text: %s", ex, text[:60])
     else:
         reply_text(open_id, text)
 
@@ -129,17 +134,26 @@ def _generate_reply_team_mode(
 ) -> ReplyResult:
     try:
         from multi_agent import handle_team_message
+        import time as _t
+
+        _last_notify = [0.0]
 
         def notify(msg: str) -> None:
+            now = _t.time()
+            if now - _last_notify[0] < 1.0:
+                _t.sleep(1.0)
             _send_to_user(open_id, msg)
+            _last_notify[0] = _t.time()
             if progress_callback:
                 progress_callback(msg[:40], "")
 
         result = handle_team_message(user_text, open_id, CLAUDE_SESSION, notify_fn=notify)
+        lark.logger.info("[team_mode] reply len=%d preview=%s", len(result), result[:80])
         append_user_memory(open_id, "user", user_text)
         append_user_memory(open_id, "assistant", result[:500])
         return ReplyResult(True, result, "team_ok")
     except Exception as ex:
+        lark.logger.error("[team_mode] exception: %s", ex)
         return ReplyResult(False, f"团队模式异常: {ex}", "team_error")
 
 

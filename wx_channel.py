@@ -115,7 +115,8 @@ def wx_get_updates(get_updates_buf: str = "") -> dict:
     return {"ret": 0, "msgs": [], "get_updates_buf": get_updates_buf}
 
 
-def wx_send_text(to_user_id: str, text: str, context_token: str = "") -> bool:
+def _wx_send_once(to_user_id: str, text: str, context_token: str = "") -> int:
+    """Send once, return ret code (0=success, negative=error)."""
     msg = {
         "from_user_id": "",
         "to_user_id": to_user_id,
@@ -126,17 +127,51 @@ def wx_send_text(to_user_id: str, text: str, context_token: str = "") -> bool:
     }
     if context_token:
         msg["context_token"] = context_token
+    resp = _get_wx_http().post(
+        f"{WX_CONFIG.base_url}/ilink/bot/sendmessage",
+        headers=_build_headers(),
+        json={"msg": msg, "base_info": _base_info()},
+        timeout=WX_CONFIG.timeout_ms / 1000,
+    )
+    if resp.status_code != 200:
+        return -999
     try:
-        resp = _get_wx_http().post(
-            f"{WX_CONFIG.base_url}/ilink/bot/sendmessage",
-            headers=_build_headers(),
-            json={"msg": msg, "base_info": _base_info()},
-            timeout=WX_CONFIG.timeout_ms / 1000,
-        )
-        ok = resp.status_code == 200
-        if not ok:
-            print(f"[wx] sendMessage http_error: status={resp.status_code} body={resp.text[:200]}")
-        return ok
+        return resp.json().get("ret", 0)
+    except Exception:
+        return 0
+
+
+_wx_send_failures = [0]
+_wx_last_send_ts = [0.0]
+_WX_MIN_SEND_INTERVAL = 2.0
+
+
+def wx_send_text(to_user_id: str, text: str, context_token: str = "") -> bool:
+    now = time.time()
+    elapsed = now - _wx_last_send_ts[0]
+    if elapsed < _WX_MIN_SEND_INTERVAL:
+        time.sleep(_WX_MIN_SEND_INTERVAL - elapsed)
+    _wx_last_send_ts[0] = time.time()
+    try:
+        ret = _wx_send_once(to_user_id, text, context_token)
+        if ret == 0:
+            _wx_send_failures[0] = 0
+            return True
+        print(f"[wx] sendMessage ret={ret}, len={len(text)}")
+        _wx_send_failures[0] += 1
+        if _wx_send_failures[0] >= 3:
+            print(f"[wx] 3+ failures, full session reset: notifyStop + notifyStart")
+            wx_notify_stop()
+            time.sleep(1)
+            wx_notify_start()
+            _wx_send_failures[0] = 0
+            time.sleep(2)
+            ret2 = _wx_send_once(to_user_id, text, "")
+            if ret2 == 0:
+                print(f"[wx] session reset worked!")
+                return True
+            print(f"[wx] session reset failed: ret={ret2}")
+        return False
     except Exception as ex:
         print(f"[wx] sendMessage failed: {ex}")
         return False

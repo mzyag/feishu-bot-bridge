@@ -1,0 +1,223 @@
+我：麻烦优化一下feishu bot bridge,对所有从飞书或者微信发送过去的消息加个任务处理队列，任务执行了就从队列里面拿掉。要在飞书和微信的上一层加，以后如何接人其他的通讯软件，不用再调整
+AI: 收到，开始执行...
+AI: 🗺️ 调度员正在分析需求...
+AI: ## 需求理解
+
+项目结构已经摸清，下面是调度分析：
+
+```json
+{
+  "analysis": "在飞书(ws_bot.py)和微信(wx_channel.py)上层新增统一的任务处理队列，所有平台消息先入队再消费，完成后出队，实现平台无关的消息处理中间层",
+  "action": "execute",
+  "reason": "当前飞书消息直接提交到 ThreadPoolExecutor、微信直接同步调用 _generate_reply()，两条路径各自独立且耦合各自平台逻辑。需要抽取统一队列层，让新平台只需实现 '收消息→入队' 和 '收回复→发消息' 两个接口即可接入",
+  "risk_level": "medium",
+  "risk_flags": ["file_write", "core_refactor", "service_restart_required"],
+  "files_affected": [
+    "/Users/cn/Workspace/feishu-bot-bridge/task_queue.py (新建：统一队列+平台适配器接口)",
+    "/Users/cn/Workspace/feishu-bot-bridge/ws_bot.py (改造：飞书消息走统一队列入口)",
+    "/Users/cn/Workspace/feishu-bot-bridge/wx_channel.py (改造：微信消息走统一队列入口)"
+  ],
+  "plan": [
+    {
+      "step": 1,
+      "task": "新建 task_queue.py，定义三个核心抽象：① ChannelMessage 统一消息模型（含 platform/user_id/text/metadata/reply_callback 字段）② ChannelAdapter 协议类（定义 send_reply 接口，各平台实现）③ TaskQueue 类（内部用 queue.Queue + worker 线程池，支持入队/消费/完成移除/查询状态/取消）",
+      "context": "参考 ws_bot.py 现有 TaskStatus 数据结构(line ~223)、_ACTIVE_TASKS_BY_USER 字典、ThreadPoolExecutor 用法(line ~277)",
+      "validation": "syntax_check + import_test (python -c 'from task_queue import TaskQueue, ChannelMessage, ChannelAdapter')"
+    },
+    {
+      "step": 2,
+      "task": "在 task_queue.py 中实现 TaskQueue 核心逻辑：enqueue() 入队并返回 task_id → worker 从队列取任务调用 _generate_reply() → 完成后自动从活跃任务集合移除 → 支持 cancel()/status()/list_pending()。将 ws_bot.py 中的 _ACTIVE_TASKS_BY_USER/_LAST_TASKS_BY_USER/_TASK_STATUS_LOCK 等状态管理逻辑迁移到 TaskQueue 内部",
+      "context": "ws_bot.py line 1157-1264 的 task status 管理、line 2200-2258 的 _handle_message_worker 逻辑、line 2046-2135 的 _generate_reply 调用",
+      "validation": "test_run (编写简单的入队→消费→移除测试脚本验证完整生命周期)"
+    },
+    {
+      "step": 3,
+      "task": "实现 FeishuAdapter 和 WeChatAdapter 两个 ChannelAdapter：FeishuAdapter 封装现有 _reply_text/_update_message/_send_text 三个飞书发送方法；WeChatAdapter 封装 wx_channel.py 中的 wx_send_text 方法。每个 Adapter 只负责 '发消息回对应平台'",
+      "context": "ws_bot.py 中飞书发消息相关函数(搜索 _reply_text, _send_text, _update_message)、wx_channel.py 中 wx_send_text 函数",
+      "validation": "syntax_check + manual_review (确认 Adapter 接口一致性)"
+    },
+    {
+      "step": 4,
+      "task": "改造 ws_bot.py：飞书消息接收后不再直接 submit 到 ThreadPoolExecutor，改为构造 ChannelMessage 并调用 TaskQueue.enqueue()。保留去重、白名单、命令解析等前置逻辑不变，只替换 '提交执行' 这一步。删除 ws_bot.py 中被迁移到 TaskQueue 的冗余状态管理代码",
+      "context": "ws_bot.py line 2260-2316 do_p2_im_message_receive_v1、line 2312 _WORKER_POOL.submit 调用",
+      "validation": "manual_review + test_run (启动 bot 后从飞书发消息验证完整链路)"
+    },
+    {
+      "step": 5,
+      "task": "改造 wx_channel.py：微信消息接收后同样构造 ChannelMessage 并调用 TaskQueue.enqueue()，不再直接同步调用 _generate_reply()。确保 TaskQueue 是单例，飞书和微信共享同一个队列实例",
+      "context": "wx_channel.py 中消息处理循环和 _generate_reply 调用处",
+      "validation": "manual_review + test_run (启动 bot 后从微信发消息验证完整链路)"
+    }
+  ],
+  "review_focus": [
+    "线程安全：TaskQueue 内部状态（活跃任务集合、队列）需要加锁，确保飞书/微信并发入队不冲突",
+    "向后兼容：现有的 /status、/trace、/cancel 等命令需要能查询到 TaskQueue 中的任务状态",
+    "优雅退出：进程关闭时队列中未完成任务的处理（drain 或持久化）",
+    "扩展性验证：模拟新增第三平台（如 Telegram）只需实现 Adapter + 入队调用，不改 TaskQueue"
+  ]
+}
+```
+
+---
+
+### 架构示意
+
+```
+┌──────────┐  ┌──────────┐  ┌──────────┐
+│  飞书 WS  │  │ 微信 Poll │  │ 未来平台  │   ← 各平台收消息
+└────┬─────┘  └────┬─────┘  └────┬─────┘
+     │              │              │
+     ▼              ▼              ▼
+  构造 ChannelMessage（统一消息模型）
+     │              │              │
+     └──────┬───────┘──────────────┘
+            ▼
+   ┌─────────────────┐
+   │    TaskQueue     │  ← 新增的统一队列层
+   │  ┌───────────┐   │
+   │  │ queue.Queue│   │    入队 → 消费 → 完成移除
+   │  └───────────┘   │
+   │  Worker Pool(4)  │
+   │  任务状态跟踪     │
+   │  取消/查询接口    │
+   └────────┬─────────┘
+            │
+            ▼
+     _generate_reply()   ← 现有后端路由（不变）
+     ├─ Claude
+     ├─ Codex
+     ├─ Multi-Agent
+     └─ OpenAI fallback
+            │
+            ▼
+   ChannelAdapter.send_reply()
+     ├─ FeishuAdapter   → 飞书 IM API
+     ├─ WeChatAdapter   → 微信 API
+     └─ 未来Adapter      → 新平台 API
+```
+
+### 核心设计要点
+
+| 要点 | 说明 |
+|------|------|
+| **ChannelMessage** | 平台无关的消息模型，携带 `reply_callback` 闭包，队列消费者无需知道消息来自哪个平台 |
+| **ChannelAdapter** | Protocol 类，新平台只需实现 `send_reply(user_id, text)` |
+| **TaskQueue 单例** | 飞书和微信共享一个队列实例，统一管控并发、优先级、状态 |
+| **完成即移除** | worker 执行完毕后自动从活跃集合删除，保留最近完成记录供 `/status` 查询 |
+| **接入新平台** | 只需：① 实现 XxxAdapter ② 收到消息后构造 ChannelMessage ③ 调用 `queue.enqueue()` |
+
+需要我开始执行吗？
+
+**是否准确？** 回复「确认」进入方案规划，或补充修改需求。
+我: 确认
+AI: 收到，开始执行...
+AI: ## 执行计划
+
+**目标:** 项目结构已经摸清，下面是调度分析：
+
+```json
+{
+  "analysis": "在飞书(ws_bot.py)和微信(wx_channel.py)上层新增统一的任务处理队列，所有平台消息先入队再消费，完成后出队，实现平台无关的消息处理中间层",
+  "action": "execute",
+  "reason": "当前飞书消息直接提交到 ThreadPoolExecutor、微信直接同步调用 _generate_reply()，两条路径各自独立且耦合各自平台逻辑。需要抽取统一队列层，让新平台只需实现 '收消息→入队' 和 '收回复→发消息' 两个接口即可接入",
+  "risk_level": "medium",
+  "risk_flags": ["file_write", "core_refactor", "service_restart_required"],
+  "files_affected": [
+    "/Users/cn/Workspace/feishu-bot-bridge/task_queue.py (新建：统一队列+平台适配器接口)",
+    "/Users/cn/Workspace/feishu-bot-bridge/ws_bot.py (改造：飞书消息走统一队列入口)",
+    "/Users/cn/Workspace/feishu-bot-bridge/wx_channel.py (改造：微信消息走统一队列入口)"
+  ],
+  "plan": [
+    {
+      "step": 1,
+      "task": "新建 task_queue.py，定义三个核心抽象：① ChannelMessage 统一消息模型（含 platform/user_id/text/metadata/reply_callback 字段）② ChannelAdapter 协议类（定义 send_reply 接口，各平台实现）③ TaskQueue 类（内部用 queue.Queue + worker 线程池，支持入队/消费/完成移除/查询状态/取消）",
+      "context": "参考 ws_bot.py 现有 TaskStatus 数据结构(line ~223)、_ACTIVE_TASKS_BY_USER 字典、ThreadPoolExecutor 用法(line ~277)",
+      "validation": "syntax_check + import_test (python -c 'from task_queue import TaskQueue, ChannelMessage, ChannelAdapter')"
+    },
+    {
+      "step": 2,
+      "task": "在 task_queue.py 中实现 TaskQueue 核心逻辑：enqueue() 入队并返回 task_id → worker 从队列取任务调用 _generate_reply() → 完成后自动从活跃任务集合移除 → 支持 cancel()/status()/list_pending()。将 ws_bot.py 中的 _ACTIVE_TASKS_BY_USER/_LAST_TASKS_BY_USER/_TASK_STATUS_LOCK 等状态管理逻辑迁移到 TaskQueue 内部",
+      "context": "ws_bot.py line 1157-1264 的 task status 管理、line 2200-2258 的 _handle_message_worker 逻辑、line 2046-2135 的 _generate_reply 调用",
+      "validation": "test_run (编写简单的入队→消费→移除测试脚本验证完整生命周期)"
+    },
+    {
+      "step": 3,
+      "task": "实现 FeishuAdapter 和 WeChatAdapter 两个 ChannelAdapter：FeishuAdapter 封装现有 _reply_text/_update_message/_send_text 三个飞书发送方法；WeChatAdapter 封装 wx_channel.py 中的 wx_send_text 方法。每个 Adapter 只负责 '发消息回对应平台'",
+      "context": "ws_bot.py 中飞书发消息相关函数(搜索 _reply_text, _send_text, _update_message)、wx_channel.py 中 wx_send_text 函数",
+      "validation": "syntax_check + manual_review (确认 Adapter 接口一致性)"
+    },
+    {
+      "step": 4,
+      "task": "改造 ws_bot.py：飞书消息接收后不再直接 submit 到 ThreadPoolExecutor，改为构造 ChannelMessage 并调用 TaskQueue.enqueue()。保留去重、白名单、命令解析等前置逻辑不变，只替换 '提交执行' 这一步。删除 ws_bot.py 中被迁移到 TaskQueue 的冗余状态管理代码",
+      "context": "ws_bot.py line 2260-2316 do_p2_im_message_receive_v1、line 2312 _WORKER_POOL.submit 调用",
+      "validation": "manual_review + test_run (启动 bot 后从飞书发消息验证完整链路)"
+    },
+    {
+      "step": 5,
+      "task": "改造 wx_channel.py：微信消息接收后同样构造 ChannelMessage 并调用 TaskQueue.enqueue()，不再直接同步调用 _generate_reply()。确保 TaskQueue 是单例，飞书和微信共享同一个队列实例",
+      "context": "wx_channel.py 中消息处理循环和 _generate_reply 调用处",
+      "validation": "manual_review + test_run (启动 bot 后从微信发消息验证完整链路)"
+    }
+  ],
+  "review_focus": [
+    "线程安全：TaskQueue 内部状态（活跃任务集合、队列）需要加锁，确保飞书/微信并发入队不冲突",
+    "向后兼容：现有的 /status、/trace、/cancel 等命令需要能查询到 TaskQueue 中的任务状态",
+    "优雅退出：进程关闭时队列中未完成任务的处理（drain 或持久化）",
+    "扩展性验证：模拟新增第三平台（如 Telegram）只需实现 Adapter + 入队调用，不改 TaskQueue"
+  ]
+}
+```
+
+---
+
+### 架构示意
+
+```
+┌──────────┐  ┌──────────┐  ┌──────────┐
+│  飞书 WS  │  │ 微信 Poll │  │ 未来平台  │   ← 各平台收消息
+└────┬─────┘  └────┬─────┘  └────┬─────┘
+     │              │              │
+     ▼              ▼              ▼
+  构造 ChannelMessage（统一消息模型）
+     │              │              │
+     └──────┬───────┘──────────────┘
+            ▼
+   ┌─────────────────┐
+   │    TaskQueue     │  ← 新增的统一队列层
+   │  ┌───────────┐   │
+   │  │ queue.Queue│   │    入队 → 消费 → 完成移除
+   │  └───────────┘   │
+   │  Worker Pool(4)  │
+   │  任务状态跟踪     │
+   │  取消/查询接口    │
+   └────────┬─────────┘
+            │
+            ▼
+     _generate_reply()   ← 现有后端路由（不变）
+     ├─ Claude
+     ├─ Codex
+     ├─ Multi-Agent
+     └─ OpenAI fallback
+            │
+            ▼
+   ChannelAdapter.send_reply()
+     ├─ FeishuAdapter   → 飞书 IM API
+     ├─ WeChatAdapter   → 微信 API
+     └─ 未来Adapter      → 新平台 API
+```
+
+### 核心设计要点
+
+| 要点 | 说明 |
+|------|------|
+| **ChannelMessage** | 平台无关的消息模型，携带 `reply_callback` 闭包，队列消费者无需知道消息来自哪个平台 |
+| **ChannelAdapter** | Protocol 类，新平台只需实现 `send_reply(user_id, text)` |
+| **TaskQueue 单例** | 飞书和微信共享一个队列实例，统一管控并发、优先级、状态 |
+| **完成即移除** | worker 执行完毕后自动从活跃集合删除，保留最近完成记录供 `/status` 查询 |
+| **接入新平台** | 只需：① 实现 XxxAdapter ② 收到消息后构造 ChannelMessage ③ 调用 `queue.enqueue()` |
+
+需要我开始执行吗？
+  1. 麻烦优化一下feishu bot bridge,对所有从飞书或者微信发送过去的消息加个任务处理队列，任务执行了就从队列里面拿掉。要在飞书和微信的上一层加，以后如何接人其他的通讯软件，不用再调整  [auto]
+
+**确认执行？** 回复「确认」逐步执行 /「全部执行」一键跑完 /「取消」放弃
+我: 确认

@@ -132,13 +132,21 @@ class MessageQueue:
         heartbeat_stop = threading.Event()
 
         def _heartbeat():
+            print(f"[heartbeat] thread started for {task.user_id[:20]} seq={task.seq}")
             count = 0
             while not heartbeat_stop.wait(30):
                 if entry.done:
+                    print(f"[heartbeat] exiting: entry.done=True")
                     return
                 count += 1
                 elapsed_s = count * 30
-                task.reply_fn(f"⏳ 仍在处理中...（{elapsed_s}s）")
+                msg = f"⏳ 仍在处理中...（{elapsed_s}s）"
+                try:
+                    task.reply_fn(msg)
+                    print(f"[heartbeat] sent #{count} to {task.user_id[:20]}")
+                except Exception as ex:
+                    print(f"[heartbeat] FAILED: {ex}")
+            print(f"[heartbeat] exiting: stop event set")
 
         heartbeat_thread = threading.Thread(target=_heartbeat, name=f"heartbeat-{task.seq}", daemon=True)
         heartbeat_thread.start()
@@ -171,6 +179,7 @@ class MessageQueue:
             self._cancel_events.pop(task.user_id, None)
 
         if not self._is_latest(task.user_id, task.seq):
+            print(f"[queue] DROPPED reply (not latest): seq={task.seq}, reply[:60]={reply_result.reply[:60]}")
             self._finish(task.source, task.user_id, task.seq, ok=False, stage="已被新消息覆盖")
             return
 
@@ -180,7 +189,12 @@ class MessageQueue:
             stage="已完成" if reply_result.ok else "执行失败",
             detail=f"{reply_result.status}: {reply_result.reply[:120]}",
         )
-        task.reply_fn(reply_result.reply)
+        print(f"[queue] SENDING final reply: seq={task.seq}, len={len(reply_result.reply)}")
+        try:
+            task.reply_fn(reply_result.reply)
+            print(f"[queue] reply sent OK")
+        except Exception as ex:
+            print(f"[queue] reply FAILED: {ex}")
 
     def _finish(self, source: str, user_id: str, seq: int, ok: bool, stage: str, detail: str = "") -> None:
         with self._lock:
