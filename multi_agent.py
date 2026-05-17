@@ -189,7 +189,7 @@ _WORKFLOW_BY_USER: Dict[str, dict] = {}
 _WORKFLOW_STATE_FILE = os.path.join(os.path.dirname(__file__), ".state", "team_workflows.json")
 _WORKFLOW_TIMEOUT_SEC = 1800
 
-_CONFIRM_EXACT = {"确认", "ok", "可以", "继续", "执行", "approve", "yes", "好", "好的", "同意", "通过", "没问题", "开始", "嗯", "行"}
+_CONFIRM_EXACT = {"确认", "确定", "ok", "可以", "继续", "执行", "approve", "yes", "好", "好的", "同意", "通过", "没问题", "开始", "嗯", "行", "对", "是的", "没错"}
 _REJECT_EXACT = {"取消", "cancel", "不要", "算了", "停", "stop", "重来", "reject", "不执行", "放弃"}
 _SKIP_EXACT = {"全部执行", "一键执行", "跳过确认", "skip", "直接执行", "auto"}
 
@@ -327,7 +327,7 @@ def handle_team_message(
             clear_workflow(open_id)
             set_workflow(open_id, {"phase": "awaiting_requirement_confirm", "user_request": user_text, "skip_checkpoints": False})
             return _dispatch_requirement(open_id, claude_session, notify_fn)
-        return f"当前有待确认的计划:\n{_format_plan(wf)}\n\n回复「确认」执行 /「取消」放弃 /「全部执行」跳过确认"
+        return f"当前有待确认的计划:\n{_format_plan(wf)}\n\n没问题就说一声，或者补充修改意见"
 
     clear_workflow(open_id)
     set_workflow(open_id, {
@@ -457,7 +457,7 @@ def _dispatch_requirement(open_id: str, claude_session, notify_fn: Callable[[str
         parts.append(f"⚠️ **风险: HIGH** — {', '.join(risk_flags)}")
     elif risk_level == "medium":
         parts.append(f"**风险: MEDIUM** — {', '.join(risk_flags)}")
-    parts.append("\n回复「确认」进入方案规划，或补充修改需求，或「取消」放弃。")
+    parts.append("\n没问题就说一声，有补充直接说。")
     return "\n".join(parts)
 
 
@@ -488,7 +488,7 @@ def _dispatch_plan(open_id: str, claude_session, notify_fn: Callable[[str], None
     _save_plan_file(open_id, wf)
 
     plan_text = _format_plan(wf)
-    return f"## 执行计划\n\n{plan_text}\n\n回复「确认」逐步执行 /「全部执行」一键跑完 /「取消」放弃"
+    return f"## 执行计划\n\n{plan_text}\n\n没问题就说一声开始执行。说「全部执行」可跳过中间确认。"
 
 
 def _save_prd_file(open_id: str, user_text: str, plan: dict) -> None:

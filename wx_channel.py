@@ -70,6 +70,65 @@ def _base_info() -> dict:
     return {"channel_version": WX_CONFIG.channel_version, "bot_agent": "FeishuBotBridge/1.0"}
 
 
+_TYPING_TICKETS: Dict[str, str] = {}
+
+
+def wx_get_config(ilink_user_id: str, context_token: str = "") -> Optional[str]:
+    """Get typing_ticket for a user via getConfig API."""
+    try:
+        resp = _get_wx_http().post(
+            f"{WX_CONFIG.base_url}/ilink/bot/getconfig",
+            headers=_build_headers(),
+            json={"ilink_user_id": ilink_user_id, "context_token": context_token, "base_info": _base_info()},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            ticket = data.get("typing_ticket", "")
+            if ticket:
+                _TYPING_TICKETS[ilink_user_id] = ticket
+            return ticket
+    except Exception:
+        pass
+    return None
+
+
+def wx_send_typing(ilink_user_id: str, status: int = 1) -> bool:
+    """Send typing indicator. status: 1=typing, 2=cancel."""
+    ticket = _TYPING_TICKETS.get(ilink_user_id, "")
+    if not ticket:
+        return False
+    try:
+        resp = _get_wx_http().post(
+            f"{WX_CONFIG.base_url}/ilink/bot/sendtyping",
+            headers=_build_headers(),
+            json={"ilink_user_id": ilink_user_id, "typing_ticket": ticket, "status": status, "base_info": _base_info()},
+            timeout=5,
+        )
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+class WxTypingKeepalive:
+    """Sends typing indicator every 5s while alive. Call stop() when done."""
+
+    def __init__(self, user_id: str, context_token: str = ""):
+        self._user_id = user_id
+        self._stop = threading.Event()
+        wx_get_config(user_id, context_token)
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _loop(self):
+        while not self._stop.wait(5):
+            wx_send_typing(self._user_id, 1)
+
+    def stop(self):
+        self._stop.set()
+        wx_send_typing(self._user_id, 2)
+
+
 def wx_notify_start() -> bool:
     try:
         resp = _get_wx_http().post(
@@ -306,11 +365,18 @@ def start_wx_channel(generate_reply_fn, reply_text_fn=None) -> Optional[threadin
                             _wx_reply(uid, "\n".join(new_entries))
                     return _progress
 
+                ctx_token = _CONTEXT_TOKENS.get(from_user, "")
+                typing = WxTypingKeepalive(from_user, ctx_token)
+
+                def _wx_reply_with_typing_stop(text, uid=from_user, _typing=typing):
+                    _typing.stop()
+                    _wx_reply(uid, text)
+
                 message_queue.enqueue(MessageTask(
                     source="wechat",
                     user_id=from_user,
                     text=user_text,
-                    reply_fn=lambda text, uid=from_user: _wx_reply(uid, text),
+                    reply_fn=_wx_reply_with_typing_stop,
                     generate_reply_fn=generate_reply_fn,
                     on_progress=_make_wx_progress(from_user, last_tool_count),
                 ))
