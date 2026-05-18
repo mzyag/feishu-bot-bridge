@@ -127,6 +127,10 @@ class ClaudePersistentSession:
             "\n- 完成后简洁报告结果，像跟同事说话"
             "\n- 用中文回复"
             f"\n\n环境：工作目录 `{SETTINGS.codex_project_root}`"
+            "\n\nGit commit 格式："
+            "\n  标题: <type>(<scope>): <subject>"
+            "\n  正文: Changes:\\n1. ...\\n2. ..."
+            "\n  type: feat/fix/refactor/docs/chore/test"
         )
         cmd = [
             claude_bin,
