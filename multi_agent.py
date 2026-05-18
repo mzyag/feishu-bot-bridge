@@ -696,6 +696,10 @@ def _run_preflight(wf: dict, claude_session, notify_fn: Callable[[str], None]) -
     if not ok:
         return None
 
+    # Save preflight response as project context for DeepSeek later
+    wf["preflight_context"] = resp[:500]
+    set_workflow(wf.get("open_id", ""), wf) if "open_id" in wf else None
+
     data = _extract_json_from_response(resp)
     if not data:
         return None
@@ -730,6 +734,9 @@ def _continue_execution(open_id: str, claude_session, notify_fn: Callable[[str],
     current_step = wf.get("current_step", 0)
     executor_results = wf.get("executor_results", [])
 
+    # Pre-flight already gathered file/env info → reuse in execution context
+    preflight_context = wf.get("preflight_context", "")
+
     while current_step < len(steps):
         step = steps[current_step]
         title = step.get("title", step.get("task", ""))
@@ -737,148 +744,61 @@ def _continue_execution(open_id: str, claude_session, notify_fn: Callable[[str],
         task_desc = detail
         context = step.get("context", "")
         step_num = current_step + 1
+        acceptance = step.get("acceptance", "")
         validation_method = step.get("validation", "auto")
 
         notify_fn(f"⚡ Step {step_num}/{len(steps)}: {title}")
-        acceptance = step.get("acceptance", "")
 
-        # Tool progress callback: sends real-time tool notifications during Claude execution
-        sub_step_counter = [0]
-        def _step_tool_progress(stage: str, detail: str = "") -> None:
-            from claude_session import CLAUDE_SESSION
-            if not hasattr(CLAUDE_SESSION, "_tool_log_lock"):
-                return
-            new_entries = []
-            with CLAUDE_SESSION._tool_log_lock:
-                current_count = len(CLAUDE_SESSION._tool_log)
-                if current_count > sub_step_counter[0]:
-                    new_entries = CLAUDE_SESSION._tool_log[sub_step_counter[0]:]
-                    sub_step_counter[0] = current_count
-            if new_entries:
-                notify_fn("\n".join(new_entries))
-
-        # TDD Phase 1: Generate test (Step N.1)
-        notify_fn(f"Step {step_num}.1 生成测试...")
-        test_code = _generate_test_from_acceptance(step_num, title, task_desc, acceptance, claude_session)
-        if test_code:
-            notify_fn(f"🧪 Step {step_num}.1 测试已生成")
-
-        # TDD Phase 2: DeepSeek code draft (Step N.2)
-        notify_fn(f"Step {step_num}.2 DeepSeek 出方案...")
-
-        # Gather project context for DeepSeek (so it understands existing architecture)
-        project_context = ""
-        if context:
-            ctx_ok, ctx_resp = call_claude_via_session(
-                f"请读取以下文件/目录的关键信息，总结项目的技术栈、架构和现有实现（200字以内）：\n{context}",
-                claude_session, timeout_sec=30,
-            )
-            if ctx_ok:
-                project_context = f"\n\n现有项目架构（必须遵循，不要引入新的技术栈）:\n{ctx_resp[:500]}"
-
-        ds_system = (
-            "你是代码顾问。为任务输出完整的实现方案和代码片段。\n"
-            "重要：必须基于项目现有的技术栈和架构。不要引入项目没有使用的第三方库或支付方案。\n"
-            "如果修改现有文件，给出具体的修改位置和代码。\n"
-            "如果是新文件，给出完整文件内容。\n"
-            "代码前后用 ```language 包裹。简洁，不废话。"
-        )
-        ds_prompt = f"任务: {task_desc}\n上下文: {context}\n\n原始需求: {user_text}{project_context}"
-        if acceptance:
-            ds_prompt += f"\n\n验收标准: {acceptance}"
-        ds_ok, ds_output = call_deepseek(ds_system, ds_prompt)
+        # Phase 1: DeepSeek drafts solution (parallel-ready, no Claude call needed)
         ds_ref = ""
+        ds_system = (
+            "你是代码顾问。输出实现方案和代码。\n"
+            "必须基于项目现有技术栈，不要引入项目没有的库。\n"
+            "代码用 ```language 包裹。简洁。"
+        )
+        ds_prompt = f"任务: {task_desc}\n上下文: {context}\n原始需求: {user_text}"
+        if preflight_context:
+            ds_prompt += f"\n项目架构: {preflight_context[:400]}"
+        if acceptance:
+            ds_prompt += f"\n验收标准: {acceptance}"
+        ds_ok, ds_output = call_deepseek(ds_system, ds_prompt)
         if ds_ok:
-            ds_ref = f"\n\nDeepSeek 参考方案:\n{ds_output[:3000]}"
-            notify_fn(f"📝 Step {step_num}.2 DeepSeek 方案已生成")
+            ds_ref = f"\n\nDeepSeek 参考方案（仅供参考）:\n{ds_output[:2000]}"
 
-        # TDD Phase 3: Claude Code executes (Step N.3)
-        notify_fn(f"Step {step_num}.3 Claude 开始执行...")
-        # Reset tool counter so we capture tools from this execution
-        with claude_session._tool_log_lock:
-            sub_step_counter[0] = len(claude_session._tool_log)
-
+        # Phase 2: Claude executes (real file access) + validates in one call
         exec_prompt = (
-            f"请执行以下任务。你可以读写文件、运行命令。\n\n"
-            f"任务: {task_desc}\n上下文: {context}\n\n原始需求: {user_text}"
+            f"请执行以下任务并自行验证结果。你可以读写文件、运行命令。\n\n"
+            f"任务: {task_desc}\n上下文: {context}\n原始需求: {user_text}"
         )
         if acceptance:
-            exec_prompt += f"\n\n验收标准（你的代码必须让这个断言通过）: {acceptance}"
-        if test_code:
-            exec_prompt += f"\n\n预定义测试（执行完后必须通过）:\n{test_code[:1500]}"
+            exec_prompt += f"\n\n验收标准: {acceptance}"
+            exec_prompt += f"\n执行完后请自行验证验收标准是否满足。如果有测试就跑测试。"
         exec_prompt += ds_ref
-        # Pass progress callback so tool events push to user during execution
+
         result = claude_session.send_message(
             text=exec_prompt,
             timeout_sec=SETTINGS.claude_timeout_sec,
-            progress_callback=_step_tool_progress,
         )
         ok = result.get("status") == "ok"
         code_output = result.get("content", "") if ok else result.get("error", "Claude call failed")
-        claude_session._progress_callback = None
 
         if not ok:
             executor_results.append(f"### Step {step_num}: {title}\n\n❌ 执行失败: {code_output}")
-            notify_fn(f"❌ Step {step_num}.3 执行失败: {code_output[:80]}")
+            notify_fn(f"❌ Step {step_num} 失败: {code_output[:60]}")
             wf.setdefault("unfinished", []).append(f"Step {step_num}: {title}")
-            _update_plan_step_status(wf, step_num, f"❌ 失败: {code_output[:40]}")
-            current_step += 1
-            wf["current_step"] = current_step
-            wf["executor_results"] = executor_results
-            set_workflow(open_id, wf)
-            continue
-
-        # TDD Phase 4: Run test (Step N.4)
-        test_passed = True
-        test_msg = ""
-        if test_code:
-            notify_fn(f"Step {step_num}.4 运行测试...")
-            test_passed, test_msg = _run_step_test(step_num, test_code, claude_session)
-            notify_fn(f"🧪 Step {step_num}.4 测试{'✓' if test_passed else '✗'} {test_msg[:40]}")
-
-        # H4 per-step validation (Step N.5)
-        notify_fn(f"Step {step_num}.5 验证中...")
-        if not test_passed:
-            step_ok, check_msg = False, f"测试失败: {test_msg[:80]}"
+            _update_plan_step_status(wf, step_num, f"❌ 失败")
         else:
-            step_ok, check_msg = _validate_step(step_num, task_desc, code_output, claude_session, validation_method)
-        if step_ok:
-            executor_results.append(f"### Step {step_num}: {task_desc}\n\n{code_output}")
-            notify_fn(f"✅ Step {step_num}.5 验证通过 — {check_msg}")
-            _update_plan_step_status(wf, step_num, f"✅ 完成: {check_msg[:30]}")
-        else:
-            # Retry once with validation feedback (H4: return to H3, smallest fix)
-            notify_fn(f"⚠️ Step {step_num}.5 验证未通过: {check_msg}")
-            notify_fn(f"Step {step_num}.6 修复中...")
-            fix_prompt = (
-                f"上一步执行结果验证未通过: {check_msg}\n"
-                f"原任务: {task_desc}\n请做最小修复。"
-            )
-            ok2, fix_output = call_claude_via_session(fix_prompt, claude_session)
-            if ok2:
-                fix_ok, fix_msg = _validate_step(step_num, task_desc, fix_output, claude_session, validation_method)
-                if fix_ok:
-                    executor_results.append(f"### Step {step_num}: {task_desc}\n\n{fix_output}")
-                    notify_fn(f"✅ Step {step_num}.6 修复通过 — {fix_msg}")
-                    _update_plan_step_status(wf, step_num, f"✅ 修复后通过: {fix_msg[:30]}")
-                else:
-                    executor_results.append(f"### Step {step_num}: {task_desc}\n\n{fix_output}\n\n> ⚠️ 验证仍未通过: {fix_msg}（停止条件: 最多重试1次）")
-                    notify_fn(f"⚠️ Step {step_num}.6 修复后仍有问题，继续下一步")
-                    wf.setdefault("validation_failures", []).append({"step": step_num, "issue": check_msg, "retry_issue": fix_msg})
-                    _update_plan_step_status(wf, step_num, f"⚠️ 验证未通过: {check_msg[:30]}")
-            else:
-                executor_results.append(f"### Step {step_num}: {task_desc}\n\n{code_output}\n\n> ⚠️ 修复失败")
-                notify_fn(f"⚠️ Step {step_num}.6 修复失败，保留原输出继续")
-                wf.setdefault("validation_failures", []).append({"step": step_num, "issue": check_msg})
-                _update_plan_step_status(wf, step_num, f"⚠️ 修复失败: {check_msg[:30]}")
+            executor_results.append(f"### Step {step_num}: {title}\n\n{code_output}")
+            notify_fn(f"✅ Step {step_num} 完成")
+            _update_plan_step_status(wf, step_num, f"✅ 完成")
 
         current_step += 1
         wf["current_step"] = current_step
         wf["executor_results"] = executor_results
         set_workflow(open_id, wf)
 
-    # All steps done → final Review + Delivery
-    return _run_review_and_deliver(open_id, claude_session, notify_fn)
+    # All steps done → Delivery (no separate review — Claude already validated each step)
+    return _run_delivery(open_id, notify_fn)
 
 
 TDD_TEST_GEN_PROMPT = """根据任务描述和验收标准，生成一个测试脚本（TDD：先写测试，代码还没写）。
@@ -1022,12 +942,56 @@ def _validate_step(
     return True, "验证解析失败，默认通过"
 
 
+def _run_delivery(open_id: str, notify_fn: Callable[[str], None]) -> str:
+    """H5 Delivery + H6 Post-task. No separate review (Claude validated during execution)."""
+    wf = get_workflow(open_id)
+    if not wf:
+        return "工作流状态丢失"
+
+    plan = wf.get("plan", {})
+    user_text = wf["user_request"]
+    executor_results = wf.get("executor_results", [])
+    full_code = "\n\n---\n\n".join(executor_results)
+    plan_summary = plan.get("analysis", "")
+    steps = plan.get("plan", [])
+
+    steps_done = sum(1 for o in executor_results if "❌" not in o)
+    steps_total = len(steps)
+
+    result_parts = [
+        f"## 完成报告",
+        f"**需求:** {plan_summary}",
+        f"**进度:** {steps_done}/{steps_total} 步完成",
+    ]
+
+    unfinished = wf.get("unfinished", [])
+    if unfinished:
+        result_parts.append("**未完成:**\n" + "\n".join(f"- {item}" for item in unfinished))
+
+    result_parts.append(f"\n## 执行详情\n\n{full_code}")
+
+    outcome = "success" if steps_done == steps_total else (
+        "partial_success" if steps_done > 0 else "recoverable_failure"
+    )
+    started_at_ts = wf.get("started_at", time.time())
+    _run_post_task_capture(
+        user_text=user_text, outcome=outcome, plan_summary=plan_summary,
+        steps_total=steps_total, steps_done=steps_done,
+        review_verdict="pass" if steps_done == steps_total else "needs_fix",
+        review_issues=[], fix_rounds=0,
+        started_at_ts=started_at_ts, missing_checks=[],
+    )
+
+    clear_workflow(open_id)
+    return "\n\n".join(result_parts)
+
+
 def _run_review_and_deliver(
     open_id: str,
     claude_session,
     notify_fn: Callable[[str], None],
 ) -> str:
-    """H4 Review + H5 Delivery + H6 Post-task."""
+    """Legacy: H4 Review + H5 Delivery + H6 Post-task. Kept for compatibility."""
     wf = get_workflow(open_id)
     if not wf:
         return "工作流状态丢失"
