@@ -400,7 +400,7 @@ def start_wx_channel(generate_reply_fn, reply_text_fn=None) -> Optional[threadin
                     text=user_text,
                     reply_fn=_wx_reply_with_typing_stop,
                     generate_reply_fn=generate_reply_fn,
-                    on_progress=_make_wx_progress(from_user, last_tool_count),
+                    on_progress=None,
                 ))
 
     t = threading.Thread(target=_poll_loop, name="wx-channel-poll", daemon=True)

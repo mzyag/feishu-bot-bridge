@@ -765,13 +765,25 @@ def _continue_execution(open_id: str, claude_session, notify_fn: Callable[[str],
 
         # TDD Phase 2: DeepSeek code draft (Step N.2)
         notify_fn(f"Step {step_num}.2 DeepSeek 出方案...")
+
+        # Gather project context for DeepSeek (so it understands existing architecture)
+        project_context = ""
+        if context:
+            ctx_ok, ctx_resp = call_claude_via_session(
+                f"请读取以下文件/目录的关键信息，总结项目的技术栈、架构和现有实现（200字以内）：\n{context}",
+                claude_session, timeout_sec=30,
+            )
+            if ctx_ok:
+                project_context = f"\n\n现有项目架构（必须遵循，不要引入新的技术栈）:\n{ctx_resp[:500]}"
+
         ds_system = (
             "你是代码顾问。为任务输出完整的实现方案和代码片段。\n"
+            "重要：必须基于项目现有的技术栈和架构。不要引入项目没有使用的第三方库或支付方案。\n"
             "如果修改现有文件，给出具体的修改位置和代码。\n"
             "如果是新文件，给出完整文件内容。\n"
             "代码前后用 ```language 包裹。简洁，不废话。"
         )
-        ds_prompt = f"任务: {task_desc}\n上下文: {context}\n\n原始需求: {user_text}"
+        ds_prompt = f"任务: {task_desc}\n上下文: {context}\n\n原始需求: {user_text}{project_context}"
         if acceptance:
             ds_prompt += f"\n\n验收标准: {acceptance}"
         ds_ok, ds_output = call_deepseek(ds_system, ds_prompt)
